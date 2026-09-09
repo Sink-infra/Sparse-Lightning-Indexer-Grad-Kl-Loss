@@ -1,0 +1,11 @@
+.DS_Store
+**/.DS_Store
+
+# Local build and generated artifacts
+build/
+dist/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.so
+*.a
