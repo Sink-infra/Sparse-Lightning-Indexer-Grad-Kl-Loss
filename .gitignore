@@ -9,3 +9,6 @@ CMakeCache.txt
 *.o
 *.so
 *.a
+
+# Local validation and profiling records
+/docs/experiments/
