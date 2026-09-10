@@ -178,7 +178,7 @@ class SparseGrad {
         fOffDk = FastTake(o, batches*s2*di);
         fOffDq = FastTake(o, rows*ni*di);
         fOffDw = FastTake(o, rows*ni);
-        fOffRed = FastTake(o, 2*batches*s2*di);
+        fOffRed = FastTake(o, 4*batches*s2*di);
         uint64_t wide = (s2 > kp ? s2 : kp);
         uint64_t dim = dq > dr ? dq : dr;
         if (di > dim) dim = di;
@@ -833,16 +833,12 @@ public:
                 DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(wsAll);
                 PipeBarrier<PIPE_ALL>();
                 LocalTensor<float> acc = base[fOffRed];
-                LocalTensor<float> part = base[fOffRed][keys*fDi];
-                Duplicate(acc, 0.0f, keys*fDi);
-                for (uint32_t c = 0; c < cores; ++c) {
-                    SyncVToMte2();
-                    DataCopyExtParams pr{1, static_cast<uint32_t>(keys*fDi*sizeof(float)), 0, 0, 0};
-                    DataCopyPad(part, wsAll[(uint64_t)c*t.batchScratch], pr,
-                                DataCopyPadExtParams<float>{false,0,0,0});
-                    SyncMte2ToV();
-                    Add(acc, acc, part, keys*fDi);
-                }
+                DataCopyExtParams pr{1, static_cast<uint32_t>(cores*keys*fDi*sizeof(float)), 0, 0, 0};
+                DataCopyPad(acc, wsAll[0], pr, DataCopyPadExtParams<float>{false,0,0,0});
+                SyncMte2ToV();
+                uint32_t span = keys*fDi;
+                for (uint32_t c = 1; c < cores; ++c)
+                    Add(acc, acc, acc[(uint64_t)c*span], span);
                 FastStore(dk, 0, acc, keys*fDi);
                 float total = 0;
                 for (uint32_t c = 0; c < cores; ++c) total += losses.GetValue(c*16);
