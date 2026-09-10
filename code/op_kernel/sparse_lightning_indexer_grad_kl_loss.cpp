@@ -75,15 +75,24 @@ __aicore__ inline bool operator>(SliPair a, SliPair b) {
 }
 __aicore__ inline SliPair SliPairExp(SliPair x) {
     if(x.hi < -87.0f) return SliPair(0);
+    if(x.hi==0 && x.lo==0) return SliPair(1);
     float z=x.hi*1.4426950408889634f;
-    int n=static_cast<int>(z);
-    if(z<static_cast<float>(n)) --n;
+    int n=static_cast<int>(z+(z>=0?0.5f:-0.5f));
     SliPair r=x-SliPair(0.693147182464599609375f,-1.904654323148236e-9f)*SliPair(static_cast<float>(n));
-    SliPair term(1),sum(1);
-    for(int i=1;i<=16;++i) {
-        term=term*r/SliPair(static_cast<float>(i));
-        sum=sum+term;
-    }
+    // Centering the interval bounds the degree-12 Taylor remainder below 3e-16.
+    SliPair sum=SliPair(2.08767558795841524e-09f,1.10828398092043424e-16f);
+    sum=sum*r+SliPair(2.50521079436794025e-08f,4.41762304464836646e-16f);
+    sum=sum*r+SliPair(2.75573199814971304e-07f,-7.57511220905119492e-15f);
+    sum=sum*r+SliPair(2.75573188446287531e-06f,3.79357122429722915e-14f);
+    sum=sum*r+SliPair(2.48015876422869042e-05f,-3.40699609366681977e-13f);
+    sum=sum*r+SliPair(1.98412701138295233e-04f,-2.72559687493345582e-12f);
+    sum=sum*r+SliPair(1.38888892251998186e-03f,-3.36310944371032150e-11f);
+    sum=sum*r+SliPair(8.33333376795053482e-03f,-4.34617203337595015e-10f);
+    sum=sum*r+SliPair(4.16666679084300995e-02f,-1.24176346982807218e-09f);
+    sum=sum*r+SliPair(1.66666671633720398e-01f,-4.96705387931228870e-09f);
+    sum=sum*r+SliPair(5.00000000000000000e-01f,0.00000000000000000e+00f);
+    sum=sum*r+SliPair(1.00000000000000000e+00f,0.00000000000000000e+00f);
+    sum=sum*r+SliPair(1.00000000000000000e+00f,0.00000000000000000e+00f);
     union {uint32_t u;float f;} power;
     power.u=static_cast<uint32_t>(n+127)<<23;
     return sum*SliPair(power.f);
