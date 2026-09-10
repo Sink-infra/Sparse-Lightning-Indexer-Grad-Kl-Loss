@@ -125,7 +125,8 @@ class SparseGrad {
     uint32_t fN1, fNI, fDq, fDr, fDi, fK, fKP, fS2, fRows;
     uint64_t fOffQ, fOffQR, fOffQI, fOffW, fOffMax, fOffSum, fOffC;
     uint64_t fOffKey, fOffKeyR, fOffKi, fOffSim, fOffSelK, fOffSelKR, fOffSelKI;
-    uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx;
+    uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx, fOffRed;
+    GlobalTensor<float> wsAll;
     uint64_t fOffSco, fOffPos, fOffDiMat, fOffV, fOffU, fOffUmat, fOffDqAcc, fOffWStage;
     uint32_t fWStageStride;
     uint32_t fN1P, fNIP;
@@ -174,9 +175,10 @@ class SparseGrad {
         fOffSelK = FastTake(o, kp*dq);
         fOffSelKR = FastTake(o, kp*dr);
         fOffSelKI = FastTake(o, kp*di);
-        fOffDk = FastTake(o, s2*di);
+        fOffDk = FastTake(o, batches*s2*di);
         fOffDq = FastTake(o, rows*ni*di);
         fOffDw = FastTake(o, rows*ni);
+        fOffRed = FastTake(o, 2*batches*s2*di);
         uint64_t wide = (s2 > kp ? s2 : kp);
         uint64_t dim = dq > dr ? dq : dr;
         if (di > dim) dim = di;
@@ -279,6 +281,7 @@ public:
         dq.SetGlobalBuffer((__gm__ T*)dQuery); dk.SetGlobalBuffer((__gm__ T*)dKey);
         dw.SetGlobalBuffer((__gm__ W*)dWeight); loss.SetGlobalBuffer((__gm__ float*)outputLoss);
         scratch.SetGlobalBuffer((__gm__ float*)workspace + GetBlockIdx()*t.batchScratch);
+        wsAll.SetGlobalBuffer((__gm__ float*)workspace);
         losses.SetGlobalBuffer((__gm__ float*)workspace + t.cores*t.batchScratch);
         stride = (t.indexDim + 7)/8*8;
         uint32_t cacheSize = t.indexHeads*stride;
@@ -441,6 +444,11 @@ public:
         SetFlag<HardEvent::V_MTE3>(id);
         WaitFlag<HardEvent::V_MTE3>(id);
     }
+    __aicore__ inline void SyncVToMte2() {
+        TEventID id = pipe.FetchEventID(HardEvent::V_MTE2);
+        SetFlag<HardEvent::V_MTE2>(id);
+        WaitFlag<HardEvent::V_MTE2>(id);
+    }
     __aicore__ inline void SyncMte3ToV() {
         TEventID id = pipe.FetchEventID(HardEvent::MTE3_V);
         SetFlag<HardEvent::MTE3_V>(id);
@@ -517,10 +525,16 @@ public:
     // Single block, all inputs resident in UB, whole tensors moved in one burst.
     // Score work is organized per selected key so one vector op covers every head.
     __aicore__ inline void ProcessFast() {
-        if (GetBlockIdx() != 0) return;
         LocalTensor<float> base = a;
         LocalTensor<int32_t> idxT = base[fOffIdx].ReinterpretCast<int32_t>();
         uint32_t keys = static_cast<uint32_t>((uint64_t)t.batch*fS2);
+        // (batch, row) tokens are split evenly across the launched cores.
+        uint32_t cores = t.cores ? t.cores : 1u;
+        uint32_t first = GetBlockIdx() * ((fRows + cores - 1) / cores);
+        uint32_t last = first + ((fRows + cores - 1) / cores);
+        if (last > fRows) last = fRows;
+        if (first > fRows) first = fRows;
+        uint32_t mine = last - first;
         // pad lanes of narrow padded rows must read as zero for later vector ops
         Duplicate(base[fOffC], 0.0f, fRows*fN1P);
         if (!((fNIP == fNI) && (fN1P == fN1))) {
@@ -529,45 +543,46 @@ public:
             Duplicate(base[fOffSum], 0.0f, fRows*fN1P);
         }
         // every transfer is issued before a single pipeline wait
-        FastDma(base[fOffQ], q, 0, fRows*fN1*fDq, fStgQ);
-        FastDma(base[fOffQR], qr, 0, fRows*fN1*fDr, fStgQR);
-        FastDma(base[fOffQI], qi, 0, fRows*fNI*fDi, fStgQI);
+        FastDma(base[fOffQ], q, (uint64_t)first*fN1*fDq, mine*fN1*fDq, fStgQ);
+        FastDma(base[fOffQR], qr, (uint64_t)first*fN1*fDr, mine*fN1*fDr, fStgQR);
+        FastDma(base[fOffQI], qi, (uint64_t)first*fNI*fDi, mine*fNI*fDi, fStgQI);
         FastDma(base[fOffKey], k, 0, keys*fDq, fStgKey);
         FastDma(base[fOffKeyR], kr, 0, keys*fDr, fStgKeyR);
         FastDma(base[fOffKi], ki, 0, keys*fDi, fStgKi);
-        if (fRows*fK) FastPad(idxT, indices, 0, fRows*fK);
+        if (mine*fK) FastPad(idxT, indices, (uint64_t)first*fK, mine*fK);
         // narrow rows must start on a 32B boundary: with a block aligned width a
         // single transfer per tensor is enough, otherwise go row by row
         bool narrowAligned = (fNIP == fNI) && (fN1P == fN1);
         if (narrowAligned) {
             if constexpr (AscendC::IsSameType<W,float>::value) {
-                FastPad(base[fOffW], w, 0, fRows*fNI);
+                FastPad(base[fOffW], w, (uint64_t)first*fNI, mine*fNI);
             } else {
-                FastPad(a[fOffWStage].ReinterpretCast<W>(), w, 0, fRows*fNI);
+                FastPad(a[fOffWStage].ReinterpretCast<W>(), w, (uint64_t)first*fNI, mine*fNI);
             }
-            FastPad(base[fOffMax], maxima, 0, fRows*fN1);
-            FastPad(base[fOffSum], sums, 0, fRows*fN1);
+            FastPad(base[fOffMax], maxima, (uint64_t)first*fN1, mine*fN1);
+            FastPad(base[fOffSum], sums, (uint64_t)first*fN1, mine*fN1);
         } else {
-            for (uint32_t r = 0; r < fRows; ++r) {
+            for (uint32_t r = 0; r < mine; ++r) {
+                uint32_t tr = first + r;
                 if constexpr (AscendC::IsSameType<W,float>::value) {
-                    FastPad(base[fOffW][r*fNIP], w, (uint64_t)r*fNI, fNI);
+                    FastPad(base[fOffW][r*fNIP], w, (uint64_t)tr*fNI, fNI);
                 } else {
-                    FastPad(a[fOffWStage].ReinterpretCast<W>()[r*fWStageStride], w, (uint64_t)r*fNI, fNI);
+                    FastPad(a[fOffWStage].ReinterpretCast<W>()[r*fWStageStride], w, (uint64_t)tr*fNI, fNI);
                 }
-                FastPad(base[fOffMax][r*fN1P], maxima, (uint64_t)r*fN1, fN1);
-                FastPad(base[fOffSum][r*fN1P], sums, (uint64_t)r*fN1, fN1);
+                FastPad(base[fOffMax][r*fN1P], maxima, (uint64_t)tr*fN1, fN1);
+                FastPad(base[fOffSum][r*fN1P], sums, (uint64_t)tr*fN1, fN1);
             }
         }
         SyncMte2ToV();
-        FastCast<T>(base[fOffQ], fStgQ, fRows*fN1*fDq);
-        FastCast<QR>(base[fOffQR], fStgQR, fRows*fN1*fDr);
-        FastCast<T>(base[fOffQI], fStgQI, fRows*fNI*fDi);
+        FastCast<T>(base[fOffQ], fStgQ, mine*fN1*fDq);
+        FastCast<QR>(base[fOffQR], fStgQR, mine*fN1*fDr);
+        FastCast<T>(base[fOffQI], fStgQI, mine*fNI*fDi);
         if constexpr (!AscendC::IsSameType<W,float>::value) {
             if (narrowAligned) {
                 Cast(base[fOffW], a[fOffWStage].ReinterpretCast<W>(), RoundMode::CAST_NONE,
-                     static_cast<int32_t>(fRows*fNI));
+                     static_cast<int32_t>(mine*fNI));
             } else {
-                for (uint32_t r = 0; r < fRows; ++r)
+                for (uint32_t r = 0; r < mine; ++r)
                     Cast(base[fOffW][r*fNIP], a[fOffWStage].ReinterpretCast<W>()[r*fWStageStride],
                          RoundMode::CAST_NONE, static_cast<int32_t>(fNI));
             }
@@ -575,14 +590,14 @@ public:
         FastCast<T>(base[fOffKey], fStgKey, keys*fDq);
         FastCast<KR>(base[fOffKeyR], fStgKeyR, keys*fDr);
         FastCast<T>(base[fOffKi], fStgKi, keys*fDi);
-        Muls(base[fOffQ], base[fOffQ], t.scale, fRows*fN1*fDq);
-        Muls(base[fOffQR], base[fOffQR], t.scale, fRows*fN1*fDr);
+        Muls(base[fOffQ], base[fOffQ], t.scale, mine*fN1*fDq);
+        Muls(base[fOffQR], base[fOffQR], t.scale, mine*fN1*fDr);
         if (!t.fastRecompute) {
-            Ln(base[fOffC], base[fOffSum], fRows*fN1P);
-            Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
+            Ln(base[fOffC], base[fOffSum], mine*fN1P);
+            Add(base[fOffC], base[fOffC], base[fOffMax], mine*fN1P);
         }
-        Duplicate(base[fOffDq], 0.0f, fRows*fNI*fDi);
-        Duplicate(base[fOffDw], 0.0f, fRows*fNI);
+        Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi);
+        Duplicate(base[fOffDw], 0.0f, mine*fNI);
 
         LocalTensor<float> lossAcc = base[fOffAux][1024];
         Duplicate(lossAcc, 0.0f, 8);
@@ -599,7 +614,7 @@ public:
         LocalTensor<float> diMat = base[fOffDiMat];
         LocalTensor<float> vMat = base[fOffV];
         LocalTensor<float> uMat = base[fOffU];
-        LocalTensor<float> scratch = base[fOffUmat];
+        LocalTensor<float> ubScratch = base[fOffUmat];
         LocalTensor<float> dqAcc = base[fOffDqAcc];
         LocalTensor<float> prod = base[fOffProd];
         LocalTensor<float> prod2 = base[fOffProd][(uint64_t)fN1P*fDq + 64];
@@ -616,9 +631,12 @@ public:
             useProvided = false;
             LocalTensor<float> qRowBase = base[fOffQ];
             LocalTensor<float> qrRowBase = base[fOffQR];
-            uint32_t qlen0 = t.empty ? 0 : Length(true, 0);
-            uint32_t klen0 = Length(false, 0);
-            int32_t vis0 = static_cast<int32_t>(klen0) - static_cast<int32_t>(qlen0) + 1;
+            uint32_t b0 = first / t.queryRows;
+            uint32_t r0 = first - b0*t.queryRows;
+            uint32_t qlen0 = t.empty ? 0 : Length(true, b0);
+            uint32_t klen0 = Length(false, b0);
+            int32_t vis0 = static_cast<int32_t>(r0) + static_cast<int32_t>(klen0)
+                           - static_cast<int32_t>(qlen0) + 1;
             if (qlen0 > 0 && vis0 > 0) {
                 // A supplied (max, sum) pair is only trustworthy if the exact
                 // scores reproduce its sum when the supplied offset is applied.
@@ -638,8 +656,13 @@ public:
                     WholeReduceSum(work[64], work, vis0, 1, 1, 1, 1);
                     float diff = work[64].GetValue(0) - givenSum;
                     if (diff < 0) diff = -diff;
-                    float bound = 1e-4f * (givenSum > 0 ? givenSum : -givenSum);
-                    useProvided = diff <= (bound > 1e-4f ? bound : 1e-4f);
+                    // A supplied (max, sum) pair is trusted while it stays within a
+                    // per-cent of the exact normalizer. Statistics rounded by a
+                    // half-precision forward pass land near 5e-4 and only rescale each
+                    // head's distribution, which cancels in the selected renormalization;
+                    // larger disagreements mean the pair belongs to a different window.
+                    float bound = 1e-2f * (givenSum > 0 ? givenSum : -givenSum);
+                    useProvided = diff <= (bound > 1e-3f ? bound : 1e-3f);
                 }
             }
             if (useProvided) {
@@ -647,29 +670,33 @@ public:
                 Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
             }
         }
+        Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
+        if (mine) Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi);
+        Duplicate(base[fOffDw], 0.0f, fRows*fNI);
         for (uint32_t b = 0; b < t.batch; ++b) {
             uint32_t qlen = t.empty ? 0 : Length(true, b);
             uint32_t klen = Length(false, b);
-            Duplicate(base[fOffDk], 0.0f, fS2*fDi);
             for (uint32_t row = 0; row < t.queryRows; ++row) {
-                if (row >= qlen) continue;
                 uint64_t token = (uint64_t)b*t.queryRows + row;
+                if (token < first || token >= last) continue;
+                if (row >= qlen) continue;
+                uint32_t local = (uint32_t)(token - first);
                 int32_t visible = static_cast<int32_t>(row) + static_cast<int32_t>(klen)
                                   - static_cast<int32_t>(qlen) + 1;
                 uint32_t m = 0;
                 for (uint32_t j = 0; j < fK; ++j) {
-                    int32_t key = idxT.GetValue(token*fK + j);
+                    int32_t key = idxT.GetValue((uint64_t)local*fK + j);
                     if (key >= 0 && key < static_cast<int32_t>(klen) && key < visible)
                         sel[m++] = static_cast<uint32_t>(key);
                 }
                 if (m == 0) continue;
-                LocalTensor<float> qRow = base[fOffQ][token*fN1*fDq];
-                LocalTensor<float> qrRow = base[fOffQR][token*fN1*fDr];
-                LocalTensor<float> qiRow = base[fOffQI][token*fNI*fDi];
-                LocalTensor<float> dqRow = base[fOffDq][token*fNI*fDi];
-                LocalTensor<float> dwRow = base[fOffDw][token*fNI];
-                LocalTensor<float> wRow = base[fOffW][token*fNIP];
-                LocalTensor<float> cRow = base[fOffC][token*fN1P];
+                LocalTensor<float> qRow = base[fOffQ][(uint64_t)local*fN1*fDq];
+                LocalTensor<float> qrRow = base[fOffQR][(uint64_t)local*fN1*fDr];
+                LocalTensor<float> qiRow = base[fOffQI][(uint64_t)local*fNI*fDi];
+                LocalTensor<float> dqRow = base[fOffDq][(uint64_t)local*fNI*fDi];
+                LocalTensor<float> dwRow = base[fOffDw][(uint64_t)local*fNI];
+                LocalTensor<float> wRow = base[fOffW][(uint64_t)local*fNIP];
+                LocalTensor<float> cRow = base[fOffC][(uint64_t)local*fN1P];
                 // ---- target mass over the selected keys ----
                 if (!useProvided) {
                     // rebuild per-head log-normalizers over the visible window
@@ -757,14 +784,14 @@ public:
                 for (uint32_t j = 0; j < m; ++j) {
                     LocalTensor<float> uRowJ = uMat[j*fNIP];
                     for (uint32_t p = 0; p < fDi/8; ++p) {
-                        Brcb(scratch[p*8], uRowJ, (uint8_t)(fNIP/8),
+                        Brcb(ubScratch[p*8], uRowJ, (uint8_t)(fNIP/8),
                              BrcbRepeatParams(fDi/8, fDi));
                     }
-                    Mul(prod2, base[fOffKi][((uint64_t)b*fS2 + sel[j])*fDi], scratch, fDi, fNIP,
+                    Mul(prod2, base[fOffKi][((uint64_t)b*fS2 + sel[j])*fDi], ubScratch, fDi, fNIP,
                         BinaryRepeatParams(1, 1, 1, fDi/8, 0, fDi/8));
                     Add(dqAcc, dqAcc, prod2, fNIP*fDi);
                     // dKeyIndex row for this key: sum over heads of u[j][h] * qi[h][:]
-                    Mul(prod, qiRow, scratch, fDi, fNI, BinaryRepeatParams(1,1,1, fDi/8, fDi/8, fDi/8));
+                    Mul(prod, qiRow, ubScratch, fDi, fNI, BinaryRepeatParams(1,1,1, fDi/8, fDi/8, fDi/8));
                     uint32_t left = fNI;
                     LocalTensor<float> cur = prod;
                     LocalTensor<float> nxt = prod2;
@@ -778,18 +805,55 @@ public:
                         atProd = !atProd;
                         left = half;
                     }
-                    LocalTensor<float> dkRow = base[fOffDk][(uint64_t)sel[j]*fDi];
+                    LocalTensor<float> dkRow = base[fOffDk][((uint64_t)b*fS2 + sel[j])*fDi];
                     Add(dkRow, dkRow, cur, fDi);
                 }
                 Adds(dqRow, dqAcc, 0.0f, fNI*fDi);
             }
-            FastStore(dk, (uint64_t)b*fS2*fDi, base[fOffDk], fS2*fDi);
         }
-        FastStore(dq, 0, base[fOffDq], fRows*fNI*fDi);
-        FastStore(dw, 0, base[fOffDw], fRows*fNI);
+        // ---- publish this core's share ----
+        if (mine) {
+            FastStore(dq, (uint64_t)first*fNI*fDi, base[fOffDq], mine*fNI*fDi);
+            FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
+        }
         WholeReduceSum(work[64], lossAcc, 1, 1, 1, 1, 1);
-        loss.SetValue(0, totalLoss + work[64].GetValue(0));
-        DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
+        float myLoss = totalLoss + work[64].GetValue(0);
+        if (cores > 1) {
+            // gradient accumulator and loss go through the per-core workspace slot
+            DataCopyExtParams pw{1, static_cast<uint32_t>(keys*fDi*sizeof(float)), 0, 0, 0};
+            SyncVToMte3();
+            DataCopyPad(scratch, base[fOffDk], pw);
+            PipeBarrier<PIPE_ALL>();
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(scratch);
+            losses.SetValue(GetBlockIdx()*16, myLoss);
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(losses);
+            SyncAll();
+            if (GetBlockIdx() == 0) {
+                // other cores' partials must come from GM, not from this core's cache
+                DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(wsAll);
+                PipeBarrier<PIPE_ALL>();
+                LocalTensor<float> acc = base[fOffRed];
+                LocalTensor<float> part = base[fOffRed][keys*fDi];
+                Duplicate(acc, 0.0f, keys*fDi);
+                for (uint32_t c = 0; c < cores; ++c) {
+                    SyncVToMte2();
+                    DataCopyExtParams pr{1, static_cast<uint32_t>(keys*fDi*sizeof(float)), 0, 0, 0};
+                    DataCopyPad(part, wsAll[(uint64_t)c*t.batchScratch], pr,
+                                DataCopyPadExtParams<float>{false,0,0,0});
+                    SyncMte2ToV();
+                    Add(acc, acc, part, keys*fDi);
+                }
+                FastStore(dk, 0, acc, keys*fDi);
+                float total = 0;
+                for (uint32_t c = 0; c < cores; ++c) total += losses.GetValue(c*16);
+                loss.SetValue(0, total);
+                DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
+            }
+        } else {
+            FastStore(dk, 0, base[fOffDk], keys*fDi);
+            loss.SetValue(0, myLoss);
+            DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
+        }
     }
     __aicore__ inline void Process() {
         if (t.fast) { ProcessFast(); return; }
@@ -925,7 +989,9 @@ __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     GM_ADDR sparseIndices, GM_ADDR softmaxMax, GM_ADDR softmaxSum, GM_ADDR queryRope,
     GM_ADDR keyRope, GM_ADDR actualQ, GM_ADDR actualK, GM_ADDR dQuery, GM_ADDR dKey,
     GM_ADDR dWeight, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    // the row-split fast path synchronizes cores with the hardware barrier, which
+    // needs the MIX AIV:AIC 1:0 launch type (it still starts vector cores only)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     REGISTER_TILING_DEFAULT(SparseLightningIndexerGradKlLossTilingData);
     GET_TILING_DATA_WITH_STRUCT(SparseLightningIndexerGradKlLossTilingData,t,tiling);
     SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE> op;
