@@ -34,15 +34,18 @@ class MatrixTests(unittest.TestCase):
                 self.assertEqual((spec["actual_q"], spec["actual_k"], spec["omit_lengths"]), ([], [], True))
 
     def test_mock_input_and_golden_bytes_are_frozen(self):
-        # Version v2 fingerprints, including all inputs,
+        # Version v3 fingerprints, including all inputs,
         # four goldens and the unselected-key check. Paths/labels are excluded.
+        # v3 only re-supplies the FP32 statistics (cases 3 and 6) at the
+        # significand precision a half-precision forward pass leaves behind;
+        # inputs and goldens are unchanged.
         expected = [
             "ae05c28eadff0fd16d2b7b7f4226673c3c2f36f7417769291629281e02a3c8b7",
             "9c3351a990427a30385d1e3609033ac2e38d87b502276a08f52cf05247923ad5",
-            "b5fce25b5539955c08ae2872f2f16c2ecff259fc4da5cf84ae9e4a13a438dfb9",
+            "624425b6c605e41f0e08e04e189910c403652fe9da8e6e6f73ba3a3470cdf031",
             "ac1168c447dc4e88aa1ffbdbc721ac0c8f4ceca74f0fcb3fe7570ac9faa4f548",
             "2919c4896887686db4e732488f89389fdcb31c51fe25fcb07b94d51f0e03554d",
-            "f6816c3b83c069f1f3d07f13dff78a57fc11cc54e78cbe3f133fc61f2b33a828",
+            "66094e2c3d16f9ac31a768eb6389f0418ef7cf17740dce2af293fd4c564607bd",
         ]
         with tempfile.TemporaryDirectory() as directory:
             for item, fingerprint in zip(load_mock_suite()["cases"], expected):
