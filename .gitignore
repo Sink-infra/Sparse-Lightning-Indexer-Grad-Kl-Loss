@@ -17,3 +17,7 @@ CMakeCache.txt
 /tests/common/mock_acceptance.py
 /tests/st/scripts/check_mock_history.py
 /tests/ut/test_mock_acceptance.py
+
+# Python bytecode caches
+__pycache__/
+*.pyc
