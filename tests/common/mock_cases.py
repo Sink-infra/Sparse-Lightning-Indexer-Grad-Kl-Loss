@@ -1,4 +1,5 @@
 """Fixed inputs and reference outputs for the six measured Mock cases."""
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -9,25 +10,83 @@ import numpy as np
 from tests.common.reference import canonical_arrays, reference_backward
 from tests.st.scripts.gen_data import generate_inputs, _stats, expected_storage, write_runner_fixture
 
-DATA_VERSION = "mock-six-v1"
+DATA_VERSION = "mock-six-v2-dense"
+CANCELLATION_VERSION = "mock-cancellation-v1"
 RTOL, ATOL = 0.002, 0.000001
 CONFIG = Path(__file__).resolve().parents[1] / "st/cases/mock.json"
 
 
-def load_mock_suite():
-    suite = json.loads(CONFIG.read_text())
+MEASURED_COLUMNS = ("b", "s1", "s2", "n1", "nidx1", "d_query", "d_query_index", "d_rope", "k", "scale_value", "core_dtype")
+MEASURED_CASES = (
+    (1, 2, 6, 4, 4, 32, 16, 8, 2, 0.1768, "float16"),
+    (2, 3, 8, 4, 4, 32, 16, 8, 3, 0.1768, "float16"),
+    (1, 4, 10, 8, 8, 32, 16, 8, 3, 0.125, "float32"),
+    (1, 8, 16, 8, 8, 64, 32, 16, 3, 0.125, "float16"),
+    (2, 4, 16, 8, 8, 64, 32, 16, 3, 0.125, "float16"),
+    (1, 8, 32, 16, 16, 64, 32, 16, 4, 0.125, "float32"),
+)
+
+
+def validate_mock_suite(suite):
     items = suite["cases"]
-    if (suite["data_version"] != DATA_VERSION or
-            [item["official_case"] for item in items] != list(range(1, 7)) or
-            [item["spec"]["case_id"] for item in items] != [f"mock_case_{i}" for i in range(1, 7)]):
+    if (suite["data_version"] != DATA_VERSION or len(items) != 6 or
+            [item["official_case"] for item in items] != list(range(1, 7))):
         raise ValueError("Mock requires the six ordered cases and the matching data version")
+    for number, (item, measured) in enumerate(zip(items, MEASURED_CASES), 1):
+        spec = item["spec"]
+        if (spec["case_id"] != f"mock_case_{number}" or
+                tuple(spec[name] for name in MEASURED_COLUMNS) != measured):
+            raise ValueError(f"Mock case {number} differs from measured shape/scale/dtype")
+        if any(spec[name] != value for name, value in
+               (("layout", "BSND"), ("statistics_layout", "BNSG"), ("indices_layout", "BSNK"))):
+            raise ValueError(f"Mock case {number} differs from measured layouts")
+        for name in ("weights_dtype", "query_rope_dtype", "key_rope_dtype"):
+            if (spec.get(name) or spec["core_dtype"]) != spec["core_dtype"]:
+                raise ValueError(f"Mock case {number} differs from measured dtypes")
+        if number == 2:
+            valid = (not spec["omit_lengths"] and spec["actual_seq_dtype"] == "int32" and
+                     tuple(spec["actual_q"]) == (2, 3) and tuple(spec["actual_k"]) == (5, 8))
+        else:
+            valid = spec["omit_lengths"] and not spec["actual_q"] and not spec["actual_k"]
+        if not valid:
+            raise ValueError(f"Mock case {number} differs from measured actual lengths")
     return suite
 
 
+def load_mock_suite():
+    return validate_mock_suite(json.loads(CONFIG.read_text()))
+
+
+def _expanded_attention(data, case):
+    """Use the independent dot-product oracle on concatenated main/RoPE features."""
+    if not np.any(data["queryRope"]) and not np.any(data["keyRope"]):
+        return data, case
+    expanded = {**data,
+                "query": np.concatenate((data["query"], data["queryRope"]), axis=-1),
+                "key": np.concatenate((data["key"], data["keyRope"]), axis=-1),
+                "queryRope": np.zeros_like(data["queryRope"]),
+                "keyRope": np.zeros_like(data["keyRope"])}
+    return expanded, replace(case, d_query=case.d_query + case.d_rope, rope_profile="zero")
+
+
 def generate_mock_inputs(case):
+    # A single, commit-independent workload. Dense FP32 features exercise the
+    # scalar product/gradient paths which zero-heavy cancellation probes skip.
+    data = generate_inputs(replace(case, rope_profile="zero"), 64 << 20)
+    if case.core_dtype == "float32":
+        rng = np.random.default_rng(case.seed + 1)
+        for name in ("queryRope", "keyRope"):
+            data[name][:] = rng.normal(0, 0.25, data[name].shape).astype(np.float32)
+        expanded, expanded_case = _expanded_attention(data, case)
+        data["softmaxMax"], data["softmaxSum"] = _stats(expanded_case, expanded)
+    return data
+
+
+def generate_cancellation_inputs(case):
+    """Supplemental precision regression; never used for official timing acceptance."""
     if case.case_id not in {f"mock_case_{i}" for i in range(1, 7)}:
         raise ValueError("Only the six fixed Mock cases are supported")
-    data = generate_inputs(case, 64 << 20)
+    data = generate_inputs(replace(case, rope_profile="zero"), 64 << 20)
     if case.core_dtype != "float32":
         return data
     for array in data.values():
@@ -71,6 +130,7 @@ def generate_mock_inputs(case):
 
 
 def _reference(data, case):
+    data, case = _expanded_attention(data, case)
     if case.core_dtype != "float32":
         return reference_backward(data, case)
     logical = canonical_arrays(data, case)
@@ -91,18 +151,21 @@ def _reference(data, case):
     return reference_backward(exact, case)
 
 
-def materialize_mock_fixture(case, cache_root):
-    identity = hashlib.sha256((DATA_VERSION + json.dumps(case.to_manifest(), sort_keys=True)).encode())
+def materialize_mock_fixture(case, cache_root, profile="official"):
+    if profile not in ("official", "cancellation"):
+        raise ValueError("Unknown Mock input profile")
+    version = DATA_VERSION if profile == "official" else CANCELLATION_VERSION
+    identity = hashlib.sha256((version + json.dumps(case.to_manifest(), sort_keys=True)).encode())
     for path in (Path(__file__), Path(__file__).with_name("reference.py"),
                  CONFIG.parents[1] / "scripts/gen_data.py"):
         identity.update(path.read_bytes())
-    folder = Path(cache_root) / DATA_VERSION / (case.case_id + "-" + identity.hexdigest()[:20])
+    folder = Path(cache_root) / version / (case.case_id + "-" + identity.hexdigest()[:20])
     marker = folder / ".complete"
     if marker.is_file():
         records = json.loads(marker.read_text())
         if all((folder / name).is_file() and hashlib.sha256((folder / name).read_bytes()).hexdigest() == value
                for name, value in records.items()):
             return folder
-    data = generate_mock_inputs(case)
-    write_runner_fixture(case, folder, data, expected_storage(_reference(data, case), case), DATA_VERSION)
+    data = (generate_mock_inputs if profile == "official" else generate_cancellation_inputs)(case)
+    write_runner_fixture(case, folder, data, expected_storage(_reference(data, case), case), version)
     return folder

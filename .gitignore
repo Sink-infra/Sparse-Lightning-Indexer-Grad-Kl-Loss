@@ -12,3 +12,8 @@ CMakeCache.txt
 
 # Local validation and profiling records
 /docs/experiments/
+
+# Local historical acceptance tools
+/tests/common/mock_acceptance.py
+/tests/st/scripts/check_mock_history.py
+/tests/ut/test_mock_acceptance.py
