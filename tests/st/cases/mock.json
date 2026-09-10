@@ -1,6 +1,6 @@
 {
   "description": "Six measured Mock shapes/scales/dtypes/lengths; fixed dense random FP32 workload with additive RoPE, seeded FP16 workload. Hidden tensor values are not known.",
-  "data_version": "mock-six-v2-dense",
+  "data_version": "mock-six-v3-forward-stats",
   "cases": [
     {
       "official_case": 1,

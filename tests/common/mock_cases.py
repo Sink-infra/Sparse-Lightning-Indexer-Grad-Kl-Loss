@@ -10,7 +10,7 @@ import numpy as np
 from tests.common.reference import canonical_arrays, reference_backward
 from tests.st.scripts.gen_data import generate_inputs, _stats, expected_storage, write_runner_fixture
 
-DATA_VERSION = "mock-six-v2-dense"
+DATA_VERSION = "mock-six-v3-forward-stats"
 CANCELLATION_VERSION = "mock-cancellation-v1"
 RTOL, ATOL = 0.002, 0.000001
 CONFIG = Path(__file__).resolve().parents[1] / "st/cases/mock.json"
@@ -69,6 +69,35 @@ def _expanded_attention(data, case):
     return expanded, replace(case, d_query=case.d_query + case.d_rope, rope_profile="zero")
 
 
+def forward_statistics(maxima, sums):
+    """Round supplied statistics the way a half-precision forward pass would.
+
+    The six measured cases pass softmaxMax/softmaxSum straight from the sparse
+    attention forward pass.  On the FP32 measurements those values disagree with
+    the fp64 normalizer of the visible window by more than 1e-4 relative, which
+    is exactly what makes the on-device path rebuild the normalizer instead of
+    trusting them.  Fixtures keep the fp64 oracle untouched and only degrade the
+    supplied inputs, so local timing exercises the same branch as the official
+    runner.
+    """
+    return (_round_half_significand(maxima), _round_half_significand(sums))
+
+
+def _round_half_significand(value):
+    """Round-to-nearest-even to a half-precision significand, kept as float32.
+
+    Only the significand is reduced (exponent range preserved), so the supplied
+    pair stays usable as an fp32 tensor while carrying the ~5e-4 relative
+    rounding a half-precision forward pass leaves behind.
+    """
+    bits = np.asarray(value, dtype=np.float32).view(np.uint32)
+    dropped = np.uint32(13)                       # fp32 keeps 23, half keeps 10
+    half = np.uint32(1) << (dropped - np.uint32(1))
+    rounded = (bits + half - np.uint32(1) + ((bits >> dropped) & np.uint32(1)))
+    rounded &= np.uint32(0xFFFFFFFF) << dropped
+    return rounded.view(np.float32)
+
+
 def generate_mock_inputs(case):
     # A single, commit-independent workload. Dense FP32 features exercise the
     # scalar product/gradient paths which zero-heavy cancellation probes skip.
@@ -78,7 +107,8 @@ def generate_mock_inputs(case):
         for name in ("queryRope", "keyRope"):
             data[name][:] = rng.normal(0, 0.25, data[name].shape).astype(np.float32)
         expanded, expanded_case = _expanded_attention(data, case)
-        data["softmaxMax"], data["softmaxSum"] = _stats(expanded_case, expanded)
+        maxima, sums = _stats(expanded_case, expanded)
+        data["softmaxMax"], data["softmaxSum"] = forward_statistics(maxima, sums)
     return data
 
 
