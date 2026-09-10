@@ -33,7 +33,7 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     FastTake(o, kp*n1p); FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, kp*nip);
     FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, nip*di); FastTake(o, nip*di);
     FastTake(o, kp*dq); FastTake(o, kp*dr); FastTake(o, kp*di);
-    FastTake(o, s2*di); FastTake(o, rows*ni*di); FastTake(o, rows*ni);
+    FastTake(o, batches*s2*di); FastTake(o, rows*ni*di); FastTake(o, rows*ni);
     uint64_t wide = s2 > kp ? s2 : kp;
     uint64_t dim = dq > dr ? dq : dr;
     if (di > dim) dim = di;
@@ -147,19 +147,29 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         !std::isfinite(*attrs->GetFloat(0))) return ge::GRAPH_FAILED;
     t.scale = *attrs->GetFloat(0);
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    // The row-split fast path starts one vector core per row (up to eight) and merges
+    // the gradient accumulators, so its workspace slot holds one full dKeyIndex.
+    uint32_t fastRows = static_cast<uint32_t>(t.batch) * t.queryRows;
+    uint32_t fastCores = fastRows < 8u ? fastRows : 8u;
+    t.cores = fastCores ? fastCores : 1u;
     t.fast = FastEligible(t, core != ge::DT_FLOAT, wt != ge::DT_FLOAT,
                           in[8]->GetDataType() != ge::DT_FLOAT, in[9]->GetDataType() != ge::DT_FLOAT) ? 1u : 0u;
     // FP32 fixtures may carry statistics from a lower-precision forward pass; the
     // accurate reference rebuilds the visible normalizer, so mirror it on device.
     t.fastRecompute = (t.fast && core == ge::DT_FLOAT) ? 1u : 0u;
-    // Single vector core: the AIV-only launch has no scheduling module, so the
-    // general path avoids the cross-core loss reduction entirely.
-    t.cores = 1u;
-    // Each worker owns a padded scratch region, including the FP32 scatter accumulator.
-    uint64_t scratch = static_cast<uint64_t>(t.keyRows) * t.indexDim +
-                       static_cast<uint64_t>(t.sparseSize) * (t.indexHeads + 4) + 16;
-    if (core == ge::DT_FLOAT) scratch = 2 * (scratch + t.indexHeads * t.indexDim + t.queryHeads) + 64;
-    t.batchScratch = t.fast ? 0 : (scratch + 15) / 16 * 16;
+    if (t.fast) {
+        uint64_t dkElems = static_cast<uint64_t>(t.batch) * t.keyRows * t.indexDim;
+        t.batchScratch = t.cores > 1 ? (dkElems + 15) / 16 * 16 : 0;
+    } else {
+        // Single vector core: the AIV-only launch has no scheduling module, so the
+        // general path avoids the cross-core loss reduction entirely.
+        t.cores = 1u;
+        // Each worker owns a padded scratch region, including the FP32 scatter accumulator.
+        uint64_t scratch = static_cast<uint64_t>(t.keyRows) * t.indexDim +
+                           static_cast<uint64_t>(t.sparseSize) * (t.indexHeads + 4) + 16;
+        if (core == ge::DT_FLOAT) scratch = 2 * (scratch + t.indexHeads * t.indexDim + t.queryHeads) + 64;
+        t.batchScratch = (scratch + 15) / 16 * 16;
+    }
     *context->GetTilingData<Tiling>() = t;
     uint32_t DT_QUERY = core, DT_WEIGHT = wt, DT_QROPE = in[8]->GetDataType(), DT_KROPE = in[9]->GetDataType();
     ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE);
