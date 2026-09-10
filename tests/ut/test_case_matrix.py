@@ -34,15 +34,15 @@ class MatrixTests(unittest.TestCase):
                 self.assertEqual((spec["actual_q"], spec["actual_k"], spec["omit_lengths"]), ([], [], True))
 
     def test_mock_input_and_golden_bytes_are_frozen(self):
-        # Fingerprints of the validated six fixtures, including all inputs,
+        # Version v2 fingerprints, including all inputs,
         # four goldens and the unselected-key check. Paths/labels are excluded.
         expected = [
             "ae05c28eadff0fd16d2b7b7f4226673c3c2f36f7417769291629281e02a3c8b7",
             "9c3351a990427a30385d1e3609033ac2e38d87b502276a08f52cf05247923ad5",
-            "1c86a7cf92e834664be4dc86a7310425aeecae5d7a4055b4aaf3fdaba14ed041",
+            "b5fce25b5539955c08ae2872f2f16c2ecff259fc4da5cf84ae9e4a13a438dfb9",
             "ac1168c447dc4e88aa1ffbdbc721ac0c8f4ceca74f0fcb3fe7570ac9faa4f548",
             "2919c4896887686db4e732488f89389fdcb31c51fe25fcb07b94d51f0e03554d",
-            "e6c9368bd962b2acfa181a8998ce0f04dd0f1b3927fcbe6f38eaddaee135a913",
+            "f6816c3b83c069f1f3d07f13dff78a57fc11cc54e78cbe3f133fc61f2b33a828",
         ]
         with tempfile.TemporaryDirectory() as directory:
             for item, fingerprint in zip(load_mock_suite()["cases"], expected):
@@ -55,6 +55,20 @@ class MatrixTests(unittest.TestCase):
                 before = (folder / ".complete").stat().st_mtime_ns
                 self.assertEqual(materialize_mock_fixture(case, directory), folder)
                 self.assertEqual((folder / ".complete").stat().st_mtime_ns, before)
+
+    def test_original_cancellation_fixtures_remain_frozen(self):
+        expected = {3: "1c86a7cf92e834664be4dc86a7310425aeecae5d7a4055b4aaf3fdaba14ed041",
+                    6: "e6c9368bd962b2acfa181a8998ce0f04dd0f1b3927fcbe6f38eaddaee135a913"}
+        with tempfile.TemporaryDirectory() as directory:
+            for item in load_mock_suite()["cases"]:
+                number = item["official_case"]
+                if number not in expected:
+                    continue
+                folder = materialize_mock_fixture(CaseSpec(**item["spec"]), directory, "cancellation")
+                value = hashlib.sha256()
+                for path in sorted(folder.glob("*.bin")):
+                    value.update(path.name.encode() + b"\0" + path.read_bytes())
+                self.assertEqual(value.hexdigest(), expected[number])
 
     def test_coverage(self):
         self.assertEqual(audit()["issues"], [])

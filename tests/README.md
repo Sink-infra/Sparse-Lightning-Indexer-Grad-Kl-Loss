@@ -27,7 +27,7 @@ Coverage 审计检查 `coverage.json` 中的输入规格和范围。
 |---|---|
 | `test_host_contract.py`、`host_contract.cpp` | Coverage：输入约束、输出 Shape/DType |
 | `test_reference.py` | Correctness：参考数学与有限差分 |
-| `test_profile_mapping.py` | Mock：Profiler 记录映射 |
+| `test_profile_mapping.py` | Mock：Profiler 映射及缺失、重复记录检查 |
 | `test_case_matrix.py`、`test_data_generation.py` | 分类、数据生成和缓存检查 |
 
 ## 案例选择
@@ -124,23 +124,37 @@ Runner 核对实际加载的 ACLNN 库。运行时致命错误会结束进程，
 | 6 | 1 / 8 / 32 | 16 / 16 | 64 / 32 / 16 | 4 | 0.125 | FP32 | 省略 |
 
 全部采用 BSND 输入和 BNSG 统计量；weights 及 RoPE dtype 与核心类型一致。
-`common/mock_cases.py` 只生成这六例的固定输入与四输出参考，数据版本为 `mock-six-v1`。
-四个 FP16 Case 使用固定 seed=20260908，两个 FP32 Case 使用固定数值构造；RoPE 均为零。
-FP32 Mock 参考内部重算完整可见区间的 softmax，实际输入的统计量仍为固定 FP32 数据。
-比较阈值固定为 rtol=0.002、atol=1e-6。跨版本性能比较使用相同配置、数据和比较方式。
+加载器逐项校验本表，包括 Case 6 的 K=4、Case 3 的 scale=0.125 和 Case 2 的 int32 长度。
+scale 直接使用逐 Case 给定值，不从 Dq 推导。
+
+主 Mock 数据版本为 `mock-six-v2-dense`。六例均使用固定 seed=20260908 生成稠密 query/key、
+queryIndex/keyIndex 和 weights。FP16 保持零 RoPE；FP32 使用固定的独立随机流生成稠密 RoPE，
+按 `(Q@Kᵀ + QRope@KRopeᵀ) * scale` 计算注意力。这是明确的加性 RoPE 假设，参考侧通过拼接特征调用独立 Float64 点积公式。
+FP32 oracle 重算完整可见区间的高精度统计量，运行时输入仍按 FP32 存储。
+官方隐藏 Tensor 的原始数值没有公开；这些是代表性负载，不声称恢复了官方随机数。
+所有历史版本使用同一份 fixture，禁止按提交改 seed、乘耗时系数或插入延时。
+
+原来的接近抵消输入保留为 `cancellation` 精度专项，使用独立缓存版本；它不参与官方计时验收。
+数值比较阈值保持 rtol=0.002、atol=1e-6，四输出、保护区及未选 Key 清零检查均执行。
 
 完成当前源码的干净全量构建后运行：
 
 ```bash
 python3 -m tests.st.scripts.profile_mock_workloads \
   --build-dir /path/to/final-build --rounds 3 --metrics PipeUtilization
+python3 -m tests.st.scripts.profile_mock_workloads \
+  --build-dir /path/to/final-build --input-profile cancellation --rounds 3
 ```
 
-一个 runner 执行六例并比较四输出，随后解析 Profiler 数据。
-Case 2 的实际长度明确通过 int32 Tensor 传入。数值失败继续记录其他例，运行时致命错误立即退出。
-默认三轮，结果保存在 `results/mock-profile-*/`：
-`summary.json` 记录各次 Kernel 耗时，`profiler/` 保存原始 CSV，
-`manifest.json` 记录配置、输入和构建产物。性能分析使用数值比较及运行检查均通过的结果。
+`--source-commit <SHA>` 可校验历史包，要求该提交已存在于本地且构建收据/产物哈希匹配；不会 fetch 远端。
+Case 2 的实际长度明确通过 int32 Tensor 传入。每次先数值比较，再读取 msprof `OpBasicInfo` 的
+`Task Duration(us)`；该指标包含设备任务调度、执行及响应时间，不能用 Host `elapsed_ms` 代替。
+Profiler 预热 5 次，默认记录 3 轮，验收使用中位数，同时保留全部原始样本。
+未启动 profiler、缺少记录、重复映射或输入/构建产物变更都会失败，不能仅凭进程返回 0 判定成功。
+
+对照历史结果时，必须使用对应提交的源码和相同 fixture；官方 Pass 要求本地四输出正确，
+且 `abs(本地中位耗时 - 官方耗时) / 官方耗时 <= 0.20`。Error 应按错误状态与数值反馈单独核对。
+历史验收工具和验证记录仅保留在本地；验证记录放在已忽略的 `docs/experiments/` 或仓库外。
 
 ## 依赖与来源
 

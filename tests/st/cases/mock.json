@@ -1,6 +1,6 @@
 {
-  "description": "Six fixed Mock cases: measured shape, dtype, scale and lengths; seeded FP16 data, fixed FP32 data, and zero RoPE.",
-  "data_version": "mock-six-v1",
+  "description": "Six measured Mock shapes/scales/dtypes/lengths; fixed dense random FP32 workload with additive RoPE, seeded FP16 workload. Hidden tensor values are not known.",
+  "data_version": "mock-six-v2-dense",
   "cases": [
     {
       "official_case": 1,
@@ -116,7 +116,7 @@
         "statistics_layout": "BNSG",
         "omit_lengths": true,
         "value_profile": "random",
-        "rope_profile": "zero",
+        "rope_profile": "dense_additive",
         "index_pattern": "random",
         "scale_value": 0.125,
         "seed": 20260908,
@@ -239,7 +239,7 @@
         "statistics_layout": "BNSG",
         "omit_lengths": true,
         "value_profile": "random",
-        "rope_profile": "zero",
+        "rope_profile": "dense_additive",
         "index_pattern": "random",
         "scale_value": 0.125,
         "seed": 20260908,
