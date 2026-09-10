@@ -160,6 +160,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     if (t.fast) {
         uint64_t dkElems = static_cast<uint64_t>(t.batch) * t.keyRows * t.indexDim;
         t.batchScratch = t.cores > 1 ? (dkElems + 15) / 16 * 16 : 0;
+        // the merge stages every core's partial in one burst
+        context->SetScheduleMode(1);
     } else {
         // Single vector core: the AIV-only launch has no scheduling module, so the
         // general path avoids the cross-core loss reduction entirely.
