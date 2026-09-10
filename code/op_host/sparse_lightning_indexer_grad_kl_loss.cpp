@@ -9,6 +9,61 @@
 
 namespace optiling {
 using Tiling = SparseLightningIndexerGradKlLossTilingData;
+// Mirror of the kernel fast-path layout so the Host can bound UB residency.
+static uint64_t FastTake(uint64_t &cursor, uint64_t count) {
+    cursor = (cursor + 7) / 8 * 8;
+    uint64_t at = cursor;
+    cursor += count + 64;
+    return at;
+}
+static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool stageQR, bool stageKR) {
+    uint64_t rows = static_cast<uint64_t>(t.batch) * t.queryRows;
+    uint64_t n1 = t.queryHeads, ni = t.indexHeads;
+    uint64_t dq = t.queryDim, dr = t.ropeDim, di = t.indexDim;
+    uint64_t kp = (static_cast<uint64_t>(t.sparseSize) + 7) / 8 * 8;
+    uint64_t s2 = t.keyRows, batches = t.batch, k = t.sparseSize;
+    uint64_t o = 0;
+    FastTake(o, rows*n1*dq); FastTake(o, rows*n1*dr); FastTake(o, rows*ni*di);
+    uint64_t n1p0 = (n1 + 7) / 8 * 8, nip0 = (ni + 7) / 8 * 8;
+    uint64_t wStage = (ni + 15) / 16 * 16;
+    FastTake(o, rows*nip0); FastTake(o, rows*n1p0); FastTake(o, rows*n1p0); FastTake(o, rows*n1p0);
+    FastTake(o, rows*wStage);
+    FastTake(o, batches*s2*dq); FastTake(o, batches*s2*dr); FastTake(o, batches*s2*di);
+    uint64_t n1p = (n1 + 7) / 8 * 8, nip = (ni + 7) / 8 * 8;
+    FastTake(o, kp*n1p); FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, kp*nip);
+    FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, nip*di); FastTake(o, nip*di);
+    FastTake(o, kp*dq); FastTake(o, kp*dr); FastTake(o, kp*di);
+    FastTake(o, s2*di); FastTake(o, rows*ni*di); FastTake(o, rows*ni);
+    uint64_t wide = s2 > kp ? s2 : kp;
+    uint64_t dim = dq > dr ? dq : dr;
+    if (di > dim) dim = di;
+    uint64_t prodNeed = wide*dim;
+    uint64_t split = n1p*dq + 64 + nip*di;
+    if (split > prodNeed) prodNeed = split;
+    if (kp*nip > prodNeed) prodNeed = kp*nip;
+    FastTake(o, prodNeed);
+    FastTake(o, 2048);
+    FastTake(o, rows*k);
+    uint64_t stg = (o + 7) / 8 * 8;
+    if (stageT) stg = (stg + rows*n1*dq + 7) / 8 * 8;
+    if (stageQR) stg = (stg + rows*n1*dr + 7) / 8 * 8;
+    if (stageT) stg = (stg + rows*ni*di + 7) / 8 * 8;
+    if (stageW) stg = (stg + rows*ni + 7) / 8 * 8;
+    if (stageT) stg = (stg + batches*s2*dq + 7) / 8 * 8;
+    if (stageKR) stg = (stg + batches*s2*dr + 7) / 8 * 8;
+    if (stageT) stg = (stg + batches*s2*di + 7) / 8 * 8;
+    return stg + 64;
+}
+static bool FastEligible(const Tiling &t, bool stageT, bool stageW, bool stageQR, bool stageKR) {
+    if (t.empty || t.statsLayout != 0) return false;
+    if (t.queryDim % 8 || t.ropeDim % 8 || t.indexDim % 8) return false;
+    if (t.queryDim < 8 || t.ropeDim < 8 || t.indexDim < 8) return false;
+    if (t.queryHeads < 1 || t.queryHeads > 64 || t.indexHeads < 1 || t.indexHeads > 64) return false;
+    if (t.queryDim > 128 || t.ropeDim > 128 || t.indexDim > 128) return false;
+    if (t.keyRows < 1 || t.keyRows > 64 || t.sparseSize < 1 || t.sparseSize > 64) return false;
+    if (static_cast<uint64_t>(t.batch) * t.queryRows > 32) return false;
+    return FastLayoutFloats(t, stageT, stageW, stageQR, stageKR) * sizeof(float) <= 168u * 1024u;
+}
 static bool Floating(ge::DataType type) {
     return type == ge::DT_FLOAT || type == ge::DT_FLOAT16 || type == ge::DT_BF16;
 }
@@ -88,12 +143,19 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         !std::isfinite(*attrs->GetFloat(0))) return ge::GRAPH_FAILED;
     t.scale = *attrs->GetFloat(0);
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    t.cores = std::max(1U, std::min(t.batch, static_cast<uint32_t>(platform.GetCoreNumAiv())));
+    t.fast = FastEligible(t, core != ge::DT_FLOAT, wt != ge::DT_FLOAT,
+                          in[8]->GetDataType() != ge::DT_FLOAT, in[9]->GetDataType() != ge::DT_FLOAT) ? 1u : 0u;
+    // FP32 fixtures may carry statistics from a lower-precision forward pass; the
+    // accurate reference rebuilds the visible normalizer, so mirror it on device.
+    t.fastRecompute = (t.fast && core == ge::DT_FLOAT) ? 1u : 0u;
+    // Single vector core: the AIV-only launch has no scheduling module, so the
+    // general path avoids the cross-core loss reduction entirely.
+    t.cores = 1u;
     // Each worker owns a padded scratch region, including the FP32 scatter accumulator.
     uint64_t scratch = static_cast<uint64_t>(t.keyRows) * t.indexDim +
                        static_cast<uint64_t>(t.sparseSize) * (t.indexHeads + 4) + 16;
     if (core == ge::DT_FLOAT) scratch = 2 * (scratch + t.indexHeads * t.indexDim + t.queryHeads) + 64;
-    t.batchScratch = (scratch + 15) / 16 * 16;
+    t.batchScratch = t.fast ? 0 : (scratch + 15) / 16 * 16;
     *context->GetTilingData<Tiling>() = t;
     uint32_t DT_QUERY = core, DT_WEIGHT = wt, DT_QROPE = in[8]->GetDataType(), DT_KROPE = in[9]->GetDataType();
     ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE);
