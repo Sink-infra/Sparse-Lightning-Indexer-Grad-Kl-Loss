@@ -614,24 +614,33 @@ public:
             // Provided statistics are usually the rounded exact values; probe one head
             // and only pay for recomputation when they actually disagree.
             useProvided = false;
+            LocalTensor<float> qRowBase = base[fOffQ];
+            LocalTensor<float> qrRowBase = base[fOffQR];
             uint32_t qlen0 = t.empty ? 0 : Length(true, 0);
             uint32_t klen0 = Length(false, 0);
             int32_t vis0 = static_cast<int32_t>(klen0) - static_cast<int32_t>(qlen0) + 1;
             if (qlen0 > 0 && vis0 > 0) {
-                Mul(prod, base[fOffKey], base[fOffQ], fDq, vis0,
-                    BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
-                WholeReduceSum(work, prod, fDq, vis0, 1, 1, fDq/8);
-                Mul(prod, base[fOffKeyR], base[fOffQR], fDr, vis0,
-                    BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
-                WholeReduceSum(work[64], prod, fDr, vis0, 1, 1, fDr/8);
-                Add(work, work, work[64], vis0);
-                WholeReduceMax(work[128], work, vis0, 1, 1, 1, 1, ReduceOrder::ORDER_ONLY_VALUE);
-                float probe = work[128].GetValue(0);
-                float given = base[fOffMax].GetValue(0);
-                float diff = probe - given;
-                if (diff < 0) diff = -diff;
-                float bound = 1e-4f * (probe > 0 ? probe : -probe);
-                useProvided = diff <= (bound > 1e-4f ? bound : 1e-4f);
+                // A supplied (max, sum) pair is only trustworthy if the exact
+                // scores reproduce its sum when the supplied offset is applied.
+                useProvided = true;
+                for (uint32_t h = 0; h < fN1 && useProvided; h += (fN1 > 1 ? fN1 - 1 : 1)) {
+                    Mul(prod, base[fOffKey], qRowBase[h*fDq], fDq, vis0,
+                        BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
+                    WholeReduceSum(work, prod, fDq, vis0, 1, 1, fDq/8);
+                    Mul(prod, base[fOffKeyR], qrRowBase[h*fDr], fDr, vis0,
+                        BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
+                    WholeReduceSum(work[64], prod, fDr, vis0, 1, 1, fDr/8);
+                    Add(work, work, work[64], vis0);
+                    float givenMax = base[fOffMax].GetValue(h);
+                    float givenSum = base[fOffSum].GetValue(h);
+                    Adds(work, work, -givenMax, vis0);
+                    Exp(work, work, vis0);
+                    WholeReduceSum(work[64], work, vis0, 1, 1, 1, 1);
+                    float diff = work[64].GetValue(0) - givenSum;
+                    if (diff < 0) diff = -diff;
+                    float bound = 1e-4f * (givenSum > 0 ? givenSum : -givenSum);
+                    useProvided = diff <= (bound > 1e-4f ? bound : 1e-4f);
+                }
             }
             if (useProvided) {
                 Ln(base[fOffC], base[fOffSum], fRows*fN1P);
