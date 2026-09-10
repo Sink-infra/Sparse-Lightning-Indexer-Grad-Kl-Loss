@@ -54,12 +54,16 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     if (stageT) stg = (stg + batches*s2*di + 7) / 8 * 8;
     return stg + 64;
 }
+static bool PowerOfTwo(uint32_t n) { return n && !(n & (n - 1)); }
 static bool FastEligible(const Tiling &t, bool stageT, bool stageW, bool stageQR, bool stageKR) {
     if (t.empty || t.statsLayout != 0) return false;
     if (t.queryDim % 8 || t.ropeDim % 8 || t.indexDim % 8) return false;
+    // the tiny algorithm reduces whole rows with a single masked repeat, so each
+    // row must fit one 256B block and the head trees need power-of-two widths
     if (t.queryDim < 8 || t.ropeDim < 8 || t.indexDim < 8) return false;
+    if (t.queryDim > 64 || t.ropeDim > 64 || t.indexDim > 64) return false;
+    if (!PowerOfTwo(t.queryHeads) || !PowerOfTwo(t.indexHeads)) return false;
     if (t.queryHeads < 1 || t.queryHeads > 64 || t.indexHeads < 1 || t.indexHeads > 64) return false;
-    if (t.queryDim > 128 || t.ropeDim > 128 || t.indexDim > 128) return false;
     if (t.keyRows < 1 || t.keyRows > 64 || t.sparseSize < 1 || t.sparseSize > 64) return false;
     if (static_cast<uint64_t>(t.batch) * t.queryRows > 32) return false;
     return FastLayoutFloats(t, stageT, stageW, stageQR, stageKR) * sizeof(float) <= 168u * 1024u;
