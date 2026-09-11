@@ -60,6 +60,10 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     return stg + 64;
 }
 static bool PowerOfTwo(uint32_t n) { return n && !(n & (n - 1)); }
+// One vector core per row, and the whole row budget when the shape is smaller:
+// the extra blocks only redo the shared transfers but they shorten the critical
+// path of the cores that carry a row.
+static const uint32_t TinyCores = 8u;
 // The tiny path keeps one row of work per vector core and contracts every dot
 // with a single broadcast multiply, so it needs the rope block to fold into the
 // head rows and a bounded number of selected keys.
@@ -174,6 +178,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     uint32_t fastCores = fastRows < 8u ? fastRows : 8u;
     t.cores = fastCores ? fastCores : 1u;
     t.tiny = TinyEligible(t) ? 1u : 0u;
+    // The tiny path keeps one row of work per vector core; launching the full
+    // row budget also amortises the per-core start-up, so keep the width fixed.
+    if (t.tiny) t.cores = TinyCores;
     t.fast = FastEligible(t, core != ge::DT_FLOAT, wt != ge::DT_FLOAT,
                           in[8]->GetDataType() != ge::DT_FLOAT, in[9]->GetDataType() != ge::DT_FLOAT) ? 1u : 0u;
     if (!t.fast) t.tiny = 0;
