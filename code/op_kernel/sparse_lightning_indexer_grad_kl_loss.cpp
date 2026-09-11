@@ -524,6 +524,11 @@ public:
         Adds(sum, buf, 0.0f, span + tail);
         return sum;
     }
+    __aicore__ inline void SyncMte2ToS() {
+        TEventID id = pipe->FetchEventID(HardEvent::MTE2_S);
+        SetFlag<HardEvent::MTE2_S>(id);
+        WaitFlag<HardEvent::MTE2_S>(id);
+    }
     __aicore__ inline void SyncMte2ToV() {
         TEventID id = pipe->FetchEventID(HardEvent::MTE2_V);
         SetFlag<HardEvent::MTE2_V>(id);
@@ -1298,32 +1303,49 @@ public:
             DataCopyExtParams pw{1, static_cast<uint32_t>((span + 2)*sizeof(float)), 0, 0, 0};
             DataCopyPad(scratch, base[fOffDk], pw);
             if (GetBlockIdx() == 0) {
-                LocalTensor<uint32_t> stampIn = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
+                // The next launch reads this before any core stamps again, and it
+                // depends on nothing here, so it leaves together with the fold
+                // instead of trailing it.
+                auxWords.SetValue(kEpochLane, epoch + 1u);
+                SyncSToMte3();
+                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(epochWord, auxWords, pe);
+            }
+            if (GetBlockIdx() == 0) {
+                // One copy brings in every core's partial together with the loss lane
+                // and the ready stamp that closes it, so the fold waits on a single
+                // round trip: the stamp travels last in the producer's burst, and a
+                // partial whose stamp is visible is therefore complete.
+                LocalTensor<float> buf = base[fOffRed][span + 8];
+                LocalTensor<uint32_t> stampIn = buf.ReinterpretCast<uint32_t>();
                 uint32_t expect[8];
                 for (uint32_t c = 0; c < active; ++c) expect[c] = SliStamp(epoch, c);
                 uint32_t settled = 0;
                 while (settled < active) {
                     SyncVToMte2();
-                    DataCopyExtParams pr{static_cast<uint16_t>(active), sizeof(uint32_t),
-                                         static_cast<uint32_t>((slot - 1)*sizeof(float)), 0, 0};
-                    DataCopyPad(stampIn, stamps, pr, DataCopyPadExtParams<uint32_t>{false,0,0,0});
-                    PipeBarrier<PIPE_ALL>();
+                    DataCopyExtParams pr{1, static_cast<uint32_t>(active*slot*sizeof(float)), 0, 0, 0};
+                    DataCopyPad(buf, wsAll, pr, DataCopyPadExtParams<float>{false,0,0,0});
+                    SyncMte2ToS();
                     settled = 0;
                     for (uint32_t c = 0; c < active; ++c)
-                        if (stampIn.GetValue((uint64_t)c*kStampStride) == expect[c]) ++settled;
-                    PipeBarrier<PIPE_ALL>();
+                        if (stampIn.GetValue((uint64_t)c*slot + span + 1) == expect[c]) ++settled;
                 }
-                PipeBarrier<PIPE_ALL>();
-                LocalTensor<float> acc = MergePartials(base, active, span, slot, 1u);
-                FastStore(dk, 0, acc, span);
-                SyncVToS();
-                loss.SetValue(0, acc[span].GetValue(0));
-                DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
-                // the next launch reads this before any core stamps again
-                auxWords.SetValue(kEpochLane, epoch + 1u);
-                SyncSToMte3();
-                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
-                DataCopyPad(epochWord, auxWords, pe);
+                uint32_t left = active;
+                while (left > 1) {
+                    uint32_t half = left / 2;
+                    Add(buf, buf, buf[(uint64_t)half*slot], half*slot);
+                    if (left & 1u) {
+                        Adds(buf[(uint64_t)half*slot], buf[(uint64_t)(left - 1)*slot], 0.0f, slot);
+                        left = half + 1;
+                    } else {
+                        left = half;
+                    }
+                }
+                FastStore(dk, 0, buf, span);
+                // the merged loss lane leaves through the copy path as well
+                SyncVToMte3();
+                DataCopyExtParams pl{1, sizeof(float), 0, 0, 0};
+                DataCopyPad(loss[0], buf[span], pl);
             }
         } else {
             FastStore(dk, 0, base[fOffDk], keys*fDi);
