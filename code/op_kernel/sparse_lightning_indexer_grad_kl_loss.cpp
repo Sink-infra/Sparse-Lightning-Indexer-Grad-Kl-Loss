@@ -180,7 +180,7 @@ class SparseGrad {
         fOffDq = FastTake(o, rows*ni*di);
         fOffDw = FastTake(o, rows*nip0);
         uint64_t redSpan = (uint64_t)batches*s2*di;
-        fOffRed = FastTake(o, t.tiny ? 4*redSpan + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
+        fOffRed = FastTake(o, t.tiny ? 4*(redSpan + 8) + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
         uint64_t wide = (s2 > kp ? s2 : kp);
         uint64_t dim = dq > dr ? dq : dr;
         if (di > dim) dim = di;
@@ -270,6 +270,16 @@ class SparseGrad {
         if (!type) return bound;
         int64_t value = type == 1 ? (query ? ql32.GetValue(batch) : kl32.GetValue(batch)) :
                                    (query ? ql64.GetValue(batch) : kl64.GetValue(batch));
+        return value < 0 ? 0 : (value > bound ? bound : static_cast<uint32_t>(value));
+    }
+    // The tiny path stages the length arrays once per core; a scalar global load
+    // per batch would otherwise stall the scalar pipe on every row.
+    __aicore__ inline uint32_t CachedLength(bool query, uint32_t batch, LocalTensor<int32_t> cache) {
+        uint32_t type = query ? t.queryLengthType : t.keyLengthType;
+        uint32_t bound = query ? t.queryRows : t.keyRows;
+        if (!type) return bound;
+        int64_t value = type == 1 ? static_cast<int64_t>(cache.GetValue(batch))
+                                  : cache.ReinterpretCast<int64_t>().GetValue(batch);
         return value < 0 ? 0 : (value > bound ? bound : static_cast<uint32_t>(value));
     }
     __aicore__ inline bool Valid(int32_t key, uint32_t row, uint32_t qlen, uint32_t klen) {
@@ -451,9 +461,11 @@ public:
     // only holds a few slots, so the partials arrive in bursts and each burst is
     // folded down before the next one lands.
     __aicore__ inline LocalTensor<float> MergePartials(LocalTensor<float> base, uint32_t cores,
-                                                       uint32_t span, uint32_t slot) {
+                                                       uint32_t span, uint32_t slot, uint32_t tail) {
         LocalTensor<float> sum = base[fOffRed];
-        LocalTensor<float> buf = base[fOffRed][span];
+        // the accumulator is one lane longer than a partial, so the read buffer has
+        // to start past it or the folded loss lane would overlap the first partial
+        LocalTensor<float> buf = base[fOffRed][span + 8];
         const uint32_t chunk = 3u;
         bool folded = false;
         for (uint32_t done = 0; done < cores; done += chunk) {
@@ -475,10 +487,10 @@ public:
                 }
             }
             if (!folded) {
-                Adds(sum, buf, 0.0f, span);
+                Adds(sum, buf, 0.0f, span + tail);
                 folded = true;
             } else {
-                Add(sum, sum, buf, span);
+                Add(sum, sum, buf, span + tail);
             }
         }
         return sum;
@@ -520,7 +532,8 @@ public:
             uint32_t chunk = count - done;
             if (chunk > 16384) chunk = 16384;
             DataCopyExtParams p{1, static_cast<uint32_t>(chunk*sizeof(U)), 0, 0, 0};
-            DataCopyPad(dst[done], src[offset+done], p, DataCopyPadExtParams<U>{false,0,0,0});
+            // a short block is padded with zeros, which is what the narrow rows need
+            DataCopyPad(dst[done], src[offset+done], p, DataCopyPadExtParams<U>{true, 0, 0, static_cast<U>(0)});
             done += chunk;
         }
     }
@@ -594,12 +607,7 @@ public:
         if (last > fRows) last = fRows;
         if (first > fRows) first = fRows;
         uint32_t mine = last - first;
-        // pad lanes of narrow padded rows must read as zero for later vector ops
-        if (!((fNIP == fNI) && (fN1P == fN1))) {
-            Duplicate(base[fOffW], 0.0f, fRows*fNIP);
-            Duplicate(base[fOffMax], 0.0f, fRows*fN1P);
-            Duplicate(base[fOffSum], 0.0f, fRows*fN1P);
-        }
+        // narrow rows arrive zero padded from their transfers
         // every transfer is issued before a single pipeline wait
         FastDma(base[fOffQ], q, (uint64_t)first*fN1*fDq, mine*fN1*fDq, fStgQ);
         FastDma(base[fOffQR], qr, (uint64_t)first*fN1*fDr, mine*fN1*fDr, fStgQR);
@@ -881,7 +889,7 @@ public:
                 PipeBarrier<PIPE_ALL>();
                 uint32_t span = keys*fDi;
                 uint32_t slot = t.batchScratch ? t.batchScratch : span;
-                LocalTensor<float> acc = MergePartials(base, cores, span, slot);
+                LocalTensor<float> acc = MergePartials(base, cores, span, slot, 0u);
                 FastStore(dk, 0, acc, span);
                 // the loss shares come back along with the partials
                 LocalTensor<float> lossBuf = base[fOffAux];
@@ -938,6 +946,12 @@ public:
         FastDma(base[fOffKeyR], kr, (uint64_t)kbase*fS2*fDr, kcount*fDr, fStgKeyR);
         FastDma(base[fOffKi], ki, (uint64_t)kbase*fS2*fDi, kcount*fDi, fStgKi);
         if (mine*fK) FastPad(idxT, indices, (uint64_t)first*fK, mine*fK);
+        LocalTensor<int32_t> qlenT = base[fOffAux][1024].ReinterpretCast<int32_t>();
+        LocalTensor<int32_t> klenT = base[fOffAux][1536].ReinterpretCast<int32_t>();
+        if (t.queryLengthType == 1) FastPad(qlenT, ql32, 0, t.batch);
+        else if (t.queryLengthType == 2) FastPad(qlenT.ReinterpretCast<int64_t>(), ql64, 0, t.batch);
+        if (t.keyLengthType == 1) FastPad(klenT, kl32, 0, t.batch);
+        else if (t.keyLengthType == 2) FastPad(klenT.ReinterpretCast<int64_t>(), kl64, 0, t.batch);
         if (narrowAligned) {
             if constexpr (AscendC::IsSameType<W,float>::value) {
                 FastPad(base[fOffW], w, (uint64_t)first*fNI, mine*fNI);
@@ -975,10 +989,15 @@ public:
         FastCast<T>(base[fOffKey], fStgKey, kcount*fDq);
         FastCast<KR>(base[fOffKeyR], fStgKeyR, kcount*fDr);
         FastCast<T>(base[fOffKi], fStgKi, kcount*fDi);
-        Muls(base[fOffQ], base[fOffQ], t.scale, mine*fN1*fDq);
-        Muls(base[fOffQR], base[fOffQR], t.scale, mine*fN1*fDr);
-        Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
-        if (mine) { Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi); Duplicate(base[fOffDw], 0.0f, fRows*fNIP); }
+        // the attention scale is applied to the scores, so the row vectors are
+        // transferred and kept unscaled
+        // The three accumulators sit in one contiguous span, so a single burst
+        // clears all of them; a core without rows only publishes its key share.
+        if (mine) {
+            Duplicate(base[fOffDk], 0.0f, (uint64_t)fOffDw + fRows*fNIP - fOffDk);
+        } else {
+            Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
+        }
         if (!t.fastRecompute) {
             Ln(base[fOffC], base[fOffSum], fRows*fN1P);
             Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
@@ -1003,8 +1022,8 @@ public:
         // rebuilds every head's normalizer over the visible window instead.
         bool useProvided = !t.fastRecompute;
         for (uint32_t b = 0; b < t.batch; ++b) {
-            uint32_t qlen = t.empty ? 0 : Length(true, b);
-            uint32_t klen = Length(false, b);
+            uint32_t qlen = t.empty ? 0 : CachedLength(true, b, qlenT);
+            uint32_t klen = CachedLength(false, b, klenT);
             for (uint32_t row = 0; row < t.queryRows; ++row) {
                 uint64_t token = (uint64_t)b*t.queryRows + row;
                 if (token < first || token >= last) continue;
@@ -1045,6 +1064,7 @@ public:
                                   BinaryRepeatParams(1, 1, 1, fDq/8, fDr/8, 0));
                         WholeReduceSum(hSc[h*s2p], prod, fDq, vis, 1, 1, fDq/8);
                     }
+                    Muls(hSc, hSc, t.scale, vis, (uint8_t)fN1, UnaryRepeatParams(1, 1, hstride, hstride));
                     WholeReduceMax(lossVec[128], hSc, vis, (uint8_t)fN1, 1, 1, hstride,
                                    ReduceOrder::ORDER_ONLY_VALUE);
                     WholeReduceMax(lossVec[192], lossVec[128], fN1, 1, 1, 1, 1,
@@ -1068,6 +1088,7 @@ public:
                         BinaryRepeatParams(1, 1, 1, fDi/8, fDi/8, 0));
                     WholeReduceSum(sim[j*fNIP], prod, fDi, (uint8_t)fNI, 1, 1, fDi/8);
                 }
+                Muls(sco, sco, t.scale, m*fN1P);
                 uint32_t mMask = m*fNIP;
                 Maxs(sim, sim, 0.0f, mMask);
                 Muls(ind, sim, 1e30f, mMask);
@@ -1144,25 +1165,19 @@ public:
         if (cores > 1) {
             uint32_t span = keys*fDi;
             uint32_t slot = t.batchScratch ? t.batchScratch : span;
-            DataCopyExtParams pw{1, static_cast<uint32_t>(span*sizeof(float)), 0, 0, 0};
+            // The loss share rides in the spare lane of this core's own slot, so both
+            // leave through one transfer and no cached scalar store has to be
+            // published before the barrier.
+            Duplicate(base[fOffDk][span], myLoss, 1);
             SyncVToMte3();
+            DataCopyExtParams pw{1, static_cast<uint32_t>((span + 1)*sizeof(float)), 0, 0, 0};
             DataCopyPad(scratch, base[fOffDk], pw);
-            losses.SetValue(GetBlockIdx()*16, myLoss);
-            DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(losses);
             SyncAll();
             if (GetBlockIdx() == 0) {
-                LocalTensor<float> acc = MergePartials(base, cores, span, slot);
+                LocalTensor<float> acc = MergePartials(base, cores, span, slot, 1u);
                 FastStore(dk, 0, acc, span);
-                // every core's loss share comes back in one burst instead of one
-                // uncached scalar read per core
-                LocalTensor<float> lossBuf = base[fOffAux];
-                DataCopyExtParams pl{1, static_cast<uint32_t>(cores*16*sizeof(float)), 0, 0, 0};
-                DataCopyPad(lossBuf, losses, pl, DataCopyPadExtParams<float>{false,0,0,0});
-                SyncMte2ToV();
                 SyncVToS();
-                float total = 0;
-                for (uint32_t c = 0; c < cores; ++c) total += lossBuf[c*16].GetValue(0);
-                loss.SetValue(0, total);
+                loss.SetValue(0, acc[span].GetValue(0));
                 DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
             }
         } else {
