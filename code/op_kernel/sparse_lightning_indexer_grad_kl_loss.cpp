@@ -702,6 +702,31 @@ public:
                     // rebuild per-head log-normalizers over the visible window
                     LocalTensor<float> keyB = base[fOffKey][(uint64_t)b*fS2*fDq];
                     LocalTensor<float> keyRB = base[fOffKeyR][(uint64_t)b*fS2*fDr];
+                    uint32_t s2p = (fS2 + 7) / 8 * 8;
+                    if (fN1P == fN1 && (uint64_t)fN1P*s2p <= (uint64_t)fKP*fDq) {
+                        // Stage every head's window scores in one matrix so a single
+                        // reduction replaces one reduction per head.
+                        LocalTensor<float> hSc = base[fOffSelK];
+                        for (uint32_t h = 0; h < fN1; ++h) {
+                            Mul(prod, keyB, qRow[h*fDq], fDq, visible,
+                                BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
+                            WholeReduceSum(hSc[h*s2p], prod, fDq, visible, 1, 1, fDq/8);
+                            Mul(prod, keyRB, qrRow[h*fDr], fDr, visible,
+                                BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
+                            WholeReduceSum(work, prod, fDr, visible, 1, 1, fDr/8);
+                            Add(hSc[h*s2p], hSc[h*s2p], work, visible);
+                        }
+                        // a single shift for all heads keeps the exponentials in range
+                        WholeReduceMax(work, hSc, visible, fN1, 1, 1, s2p/8);
+                        WholeReduceMax(work[64], work, fN1, 1, 1, 1, 1);
+                        float gmx = work[64].GetValue(0);
+                        Adds(hSc, hSc, -gmx, visible, (uint8_t)fN1,
+                             UnaryRepeatParams(1, 1, s2p/8, s2p/8));
+                        Exp(hSc, hSc, visible, (uint8_t)fN1, UnaryRepeatParams(1, 1, s2p/8, s2p/8));
+                        WholeReduceSum(work[128], hSc, visible, fN1, 1, 1, s2p/8);
+                        Ln(work[128], work[128], fN1);
+                        Adds(cRow, work[128], gmx, fN1);
+                    } else {
                     for (uint32_t h = 0; h < fN1; ++h) {
                         Mul(prod, keyB, qRow[h*fDq], fDq, visible,
                             BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
@@ -716,6 +741,7 @@ public:
                         Exp(work, work, visible);
                         WholeReduceSum(work[64], work, visible, 1, 1, 1, 1);
                         cRow.SetValue(h, mx + SliLog(work[64].GetValue(0)));
+                    }
                     }
                 }
                 for (uint32_t j = 0; j < m; ++j) {
