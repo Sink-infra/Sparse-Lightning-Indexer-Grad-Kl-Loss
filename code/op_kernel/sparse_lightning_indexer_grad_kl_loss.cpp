@@ -114,7 +114,7 @@ class SparseGrad {
     GlobalTensor<int64_t> ql64, kl64;
     GlobalTensor<float> maxima, sums, scratch, losses, loss;
     SparseLightningIndexerGradKlLossTilingData t;
-    TPipe pipe;
+    TPipe *pipe;
     TBuf<TPosition::VECCALC> storage;
     LocalTensor<float> a, b, product, temporary, result, qiCache, dqCache, keyCache, dkCache, gradTemp, weightOut;
     LocalTensor<uint8_t> raw;
@@ -280,8 +280,9 @@ public:
         GM_ADDR weights, GM_ADDR sparseIndices, GM_ADDR softmaxMax, GM_ADDR softmaxSum,
         GM_ADDR queryRope, GM_ADDR keyRope, GM_ADDR actualQ, GM_ADDR actualK,
         GM_ADDR dQuery, GM_ADDR dKey, GM_ADDR dWeight, GM_ADDR outputLoss, GM_ADDR workspace,
-        const SparseLightningIndexerGradKlLossTilingData &tiling) {
+        TPipe *pipeIn, const SparseLightningIndexerGradKlLossTilingData &tiling) {
         t = tiling;
+        pipe = pipeIn;
         q.SetGlobalBuffer((__gm__ T*)query); k.SetGlobalBuffer((__gm__ T*)key);
         qi.SetGlobalBuffer((__gm__ T*)queryIndex); ki.SetGlobalBuffer((__gm__ T*)keyIndex);
         w.SetGlobalBuffer((__gm__ W*)weights); indices.SetGlobalBuffer((__gm__ int32_t*)sparseIndices);
@@ -299,7 +300,7 @@ public:
         uint64_t genFloats = 2*(uint64_t)cacheSize + 512*8 + 128*4 + 64;
         uint64_t fastFloats = t.fast ? FastLayout() : 0;
         uint64_t totalFloats = genFloats > fastFloats ? genFloats : fastFloats;
-        pipe.InitBuffer(storage, totalFloats*sizeof(float));
+        pipe->InitBuffer(storage, totalFloats*sizeof(float));
         auto mem = storage.Get<float>();
         a = mem; b = mem[512]; product = mem[1024]; temporary = mem[1536]; result = mem[2048];
         raw = mem[2560].ReinterpretCast<uint8_t>();
@@ -446,32 +447,32 @@ public:
         }
     }
     __aicore__ inline void SyncMte2ToV() {
-        TEventID id = pipe.FetchEventID(HardEvent::MTE2_V);
+        TEventID id = pipe->FetchEventID(HardEvent::MTE2_V);
         SetFlag<HardEvent::MTE2_V>(id);
         WaitFlag<HardEvent::MTE2_V>(id);
     }
     __aicore__ inline void SyncVToMte3() {
-        TEventID id = pipe.FetchEventID(HardEvent::V_MTE3);
+        TEventID id = pipe->FetchEventID(HardEvent::V_MTE3);
         SetFlag<HardEvent::V_MTE3>(id);
         WaitFlag<HardEvent::V_MTE3>(id);
     }
     __aicore__ inline void SyncVToMte2() {
-        TEventID id = pipe.FetchEventID(HardEvent::V_MTE2);
+        TEventID id = pipe->FetchEventID(HardEvent::V_MTE2);
         SetFlag<HardEvent::V_MTE2>(id);
         WaitFlag<HardEvent::V_MTE2>(id);
     }
     __aicore__ inline void SyncMte3ToV() {
-        TEventID id = pipe.FetchEventID(HardEvent::MTE3_V);
+        TEventID id = pipe->FetchEventID(HardEvent::MTE3_V);
         SetFlag<HardEvent::MTE3_V>(id);
         WaitFlag<HardEvent::MTE3_V>(id);
     }
     __aicore__ inline void SyncVToS() {
-        TEventID id = pipe.FetchEventID(HardEvent::V_S);
+        TEventID id = pipe->FetchEventID(HardEvent::V_S);
         SetFlag<HardEvent::V_S>(id);
         WaitFlag<HardEvent::V_S>(id);
     }
     __aicore__ inline void SyncSToV() {
-        TEventID id = pipe.FetchEventID(HardEvent::S_V);
+        TEventID id = pipe->FetchEventID(HardEvent::S_V);
         SetFlag<HardEvent::S_V>(id);
         WaitFlag<HardEvent::S_V>(id);
     }
@@ -669,9 +670,15 @@ public:
                 float gMax[2], gSum[2], red[2];
                 hh[0] = 0;
                 hh[1] = fN1 > 1 ? fN1 - 1 : 0;
+                // stage the statistics through the vector unit: a scalar read of a
+                // freshly transferred buffer is not ordered against the copy
+                LocalTensor<float> statVec = base[fOffAux][960];
+                Adds(statVec, base[fOffMax], 0.0f, fN1);
+                Adds(statVec[64], base[fOffSum], 0.0f, fN1);
+                SyncVToS();
                 for (uint32_t t2 = 0; t2 < 2; ++t2) {
-                    gMax[t2] = base[fOffMax].GetValue(hh[t2]);
-                    gSum[t2] = base[fOffSum].GetValue(hh[t2]);
+                    gMax[t2] = statVec[hh[t2]].GetValue(0);
+                    gSum[t2] = statVec[64 + hh[t2]].GetValue(0);
                 }
                 for (uint32_t t2 = 0; t2 < 2; ++t2) {
                     uint32_t h = hh[t2];
@@ -1026,9 +1033,15 @@ public:
                 float gMax[2], gSum[2], red[2];
                 hh[0] = 0;
                 hh[1] = fN1 > 1 ? fN1 - 1 : 0;
+                // stage the statistics through the vector unit: a scalar read of a
+                // freshly transferred buffer is not ordered against the copy
+                LocalTensor<float> statVec = base[fOffAux][960];
+                Adds(statVec, base[fOffMax], 0.0f, fN1);
+                Adds(statVec[64], base[fOffSum], 0.0f, fN1);
+                SyncVToS();
                 for (uint32_t t2 = 0; t2 < 2; ++t2) {
-                    gMax[t2] = base[fOffMax].GetValue(hh[t2]);
-                    gSum[t2] = base[fOffSum].GetValue(hh[t2]);
+                    gMax[t2] = statVec[hh[t2]].GetValue(0);
+                    gSum[t2] = statVec[64 + hh[t2]].GetValue(0);
                 }
                 for (uint32_t t2 = 0; t2 < 2; ++t2) {
                     uint32_t h = hh[t2];
@@ -1373,7 +1386,8 @@ __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     REGISTER_TILING_DEFAULT(SparseLightningIndexerGradKlLossTilingData);
     GET_TILING_DATA_WITH_STRUCT(SparseLightningIndexerGradKlLossTilingData,t,tiling);
     SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE> op;
+    TPipe pipe;
     op.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
-        queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),t);
+        queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),&pipe,t);
     op.Process();
 }
