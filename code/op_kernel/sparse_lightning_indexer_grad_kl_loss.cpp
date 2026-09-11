@@ -153,7 +153,7 @@ class SparseGrad {
     uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx, fOffRed;
     uint64_t fOffDkProd, fOffDsSpr, fOffDiSpr, fOffHeadScr;
     GlobalTensor<float> wsAll;
-    GlobalTensor<uint32_t> stamps;
+    GlobalTensor<uint32_t> stampArr;
     GlobalTensor<uint32_t> epochWord;
     GlobalTensor<uint32_t> clearWord;
     uint32_t launchEpoch;
@@ -344,8 +344,8 @@ public:
         uint64_t syncBase = (uint64_t)t.cores*t.batchScratch + (uint64_t)t.cores*16;
         epochWord.SetGlobalBuffer((__gm__ uint32_t*)workspace + syncBase);
         clearWord.SetGlobalBuffer((__gm__ uint32_t*)workspace + syncBase + kClearLane);
-        stamps.SetGlobalBuffer((__gm__ uint32_t*)workspace +
-            (uint64_t)t.batch*t.keyRows*t.indexDim + 1);
+        // compact ready words, one per participating core, behind the slots
+        stampArr.SetGlobalBuffer((__gm__ uint32_t*)workspace + (uint64_t)t.cores*t.batchScratch);
         stride = (t.indexDim + 7)/8*8;
         uint32_t cacheSize = t.indexHeads*stride;
         uint64_t genFloats = 2*(uint64_t)cacheSize + 512*8 + 128*4 + 64;
@@ -1296,24 +1296,23 @@ public:
             // the epoch transfer was issued with the preamble, so it is long settled
             PipeBarrier<PIPE_ALL>();
             uint32_t epoch = auxWords.GetValue(kEpochLane);
-            // The partial goes out on its own, and the loss lane with the ready stamp
-            // follows in a second transfer.  A reader that sees the stamp can then
-            // trust the partial: the segments of a single burst are not guaranteed to
-            // land in order, but queued transfers are issued in order.
-            DataCopyExtParams pw{1, static_cast<uint32_t>(span*sizeof(float)), 0, 0, 0};
-            DataCopyPad(scratch, base[fOffDk], pw);
+            // The partial and the loss lane leave in one transfer and the ready stamp
+            // follows in a second, compact one.  A reader that sees the stamp can then
+            // trust the slot: the segments of a single burst are not guaranteed to land
+            // in order, but queued transfers are issued in order.
             Duplicate(base[fOffDk][span], myLoss, 1);
-            base[fOffDk].ReinterpretCast<uint32_t>().SetValue(span + 1, SliStamp(epoch, GetBlockIdx()));
             SyncVToMte3();
+            DataCopyExtParams pw{1, static_cast<uint32_t>((span + 1)*sizeof(float)), 0, 0, 0};
+            DataCopyPad(scratch, base[fOffDk], pw);
+            LocalTensor<uint32_t> stampOut = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
+            stampOut.SetValue(0, SliStamp(epoch, GetBlockIdx()));
             SyncSToMte3();
-            // a full 32B block, so the closing transfer keeps the copy granularity
-            DataCopyExtParams pz{1, 8*sizeof(float), 0, 0, 0};
-            DataCopyPad(scratch[span], base[fOffDk][span], pz);
+            DataCopyExtParams pz{1, sizeof(uint32_t), 0, 0, 0};
+            DataCopyPad(stampArr[GetBlockIdx()], stampOut, pz);
             if (GetBlockIdx() == 0) {
-                // One copy brings in every core's partial together with the loss lane
-                // and the ready stamp that closes it, so the fold waits on a single
-                // round trip: the stamp travels last in the producer's burst, and a
-                // partial whose stamp is visible is therefore complete.
+                // The ready words are compact, so polling costs a single 32B-class read
+                // no matter how wide a partial is; the slot span is then read once,
+                // after every stamp of this launch has been seen.
                 LocalTensor<float> buf = base[fOffRed][span + 8];
                 LocalTensor<uint32_t> stampIn = buf.ReinterpretCast<uint32_t>();
                 uint32_t expect[8];
@@ -1321,13 +1320,23 @@ public:
                 uint32_t settled = 0;
                 while (settled < active) {
                     SyncVToMte2();
-                    DataCopyExtParams pr{1, static_cast<uint32_t>(active*slot*sizeof(float)), 0, 0, 0};
-                    DataCopyPad(buf, wsAll, pr, DataCopyPadExtParams<float>{false,0,0,0});
+                    DataCopyExtParams pr{1, static_cast<uint32_t>(active*sizeof(uint32_t)), 0, 0, 0};
+                    DataCopyPad(stampIn, stampArr, pr, DataCopyPadExtParams<uint32_t>{false,0,0,0});
                     SyncMte2ToS();
                     settled = 0;
                     for (uint32_t c = 0; c < active; ++c)
-                        if (stampIn.GetValue((uint64_t)c*slot + span + 1) == expect[c]) ++settled;
+                        if (stampIn.GetValue(c) == expect[c]) ++settled;
                 }
+                // The next launch reads the epoch before any core relies on it.  Every
+                // core that carries a row has already fetched this launch's epoch (it
+                // had to stamp), so the word can move as soon as the fold may read.
+                auxWords.SetValue(kEpochLane, epoch + 1u);
+                SyncSToMte3();
+                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(epochWord, auxWords, pe);
+                DataCopyExtParams ps{1, static_cast<uint32_t>(active*slot*sizeof(float)), 0, 0, 0};
+                DataCopyPad(buf, wsAll, ps, DataCopyPadExtParams<float>{false,0,0,0});
+                SyncMte2ToV();
                 uint32_t left = active;
                 while (left > 1) {
                     uint32_t half = left / 2;
@@ -1344,14 +1353,6 @@ public:
                 SyncVToMte3();
                 DataCopyExtParams pl{1, sizeof(float), 0, 0, 0};
                 DataCopyPad(loss[0], buf[span], pl);
-                // The next launch reads this before any core stamps again.  It has to
-                // wait until the fold is done: a core that is still being dispatched
-                // has not fetched this launch's epoch yet, and a value that moves
-                // under it would make its stamps miss forever.
-                auxWords.SetValue(kEpochLane, epoch + 1u);
-                SyncSToMte3();
-                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
-                DataCopyPad(epochWord, auxWords, pe);
             }
         } else {
             FastStore(dk, 0, base[fOffDk], keys*fDi);
