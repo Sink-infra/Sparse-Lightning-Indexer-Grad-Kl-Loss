@@ -41,6 +41,7 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     uint64_t split = n1p*dq + 64 + nip*di;
     if (split > prodNeed) prodNeed = split;
     if (kp*nip > prodNeed) prodNeed = kp*nip;
+    FastTake(o, k*n1*dq); FastTake(o, k*n1*dr); FastTake(o, k*ni*di);
     FastTake(o, prodNeed);
     FastTake(o, 2048);
     FastTake(o, rows*k);
