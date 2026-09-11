@@ -60,9 +60,6 @@ constexpr uint32_t kClearStamp = 0x2000u;
 constexpr uint32_t kEpochLaneOffset = 832u;
 constexpr uint32_t kLossLane = 960u;
 constexpr uint32_t kStampLaneOffset = 896u;
-// eight-lane slots for the selected softmax, which runs entirely on the vector
-// pipe so the row never pays a scalar exp/log chain or a second drain
-constexpr uint32_t kKlLane = 1264u;
 
 // A two-float expansion retains probability residuals through cancellation.
 #pragma clang fp contract(off)
@@ -1214,71 +1211,27 @@ public:
                 Sub(prod2, sco, cRow, fN1, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fN1P/8, fN1P/8, 0));
                 Exp(prod2, prod2, fN1, (uint8_t)m, UnaryRepeatParams(1, 1, fN1P/8, fN1P/8));
                 WholeReduceSum(massV, prod2, fN1, (uint8_t)m, 1, 1, fN1P/8);
-                // The FP32 rows already run the long visible-window chain, and there a
-                // scalar softmax would drain the vector pipe twice; on the fp16 rows
-                // the chain is short and the scalar form is the cheaper one.
-                if (useProvided) {
-                    SyncVToS();
-                    float mass[8], logit[8], di[8];
-                    float msum = 0.0f, lmax = -3.4e38f;
-                    for (uint32_t j = 0; j < m; ++j) {
-                        mass[j] = massV.GetValue(j);
-                        msum += mass[j];
-                        logit[j] = logitV.GetValue(j);
-                        if (logit[j] > lmax) lmax = logit[j];
-                    }
-                    if (!(msum > 0.0f)) msum = 1.0f;
-                    float lsum = 0.0f;
-                    for (uint32_t j = 0; j < m; ++j) lsum += SliExp(logit[j] - lmax);
-                    float logl = lmax + SliLog(lsum);
-                    for (uint32_t j = 0; j < m; ++j) {
-                        float p = mass[j]/msum;
-                        float q = SliExp(logit[j] - logl);
-                        di[j] = q - p;
-                        if (p > 0.0f) totalLoss += p*(SliLog(p) - (logit[j] - logl));
-                    }
-                    for (uint32_t j = 0; j < m; ++j) dIvec.SetValue(j, di[j]);
-                    SyncSToV();
-                } else {
-                LocalTensor<float> msumV = base[fOffAux][kKlLane];
-                LocalTensor<float> lmaxV = base[fOffAux][kKlLane + 8];
-                LocalTensor<float> lsumV = base[fOffAux][kKlLane + 16];
-                LocalTensor<float> loglV = base[fOffAux][kKlLane + 24];
-                LocalTensor<float> msumB = base[fOffAux][kKlLane + 32];
-                LocalTensor<float> lmaxB = base[fOffAux][kKlLane + 40];
-                LocalTensor<float> loglB = base[fOffAux][kKlLane + 48];
-                LocalTensor<float> pV = base[fOffAux][kKlLane + 56];
-                LocalTensor<float> qV = base[fOffAux][kKlLane + 64];
-                LocalTensor<float> tmpV = base[fOffAux][kKlLane + 72];
-                LocalTensor<float> lnpV = base[fOffAux][kKlLane + 80];
-                LocalTensor<float> pcV = base[fOffAux][kKlLane + 88];
-                LocalTensor<float> contribV = base[fOffAux][kKlLane + 96];
-                WholeReduceSum(msumV, massV, m, 1, 1, 1, 1);
-                WholeReduceMax(lmaxV, logitV, m, 1, 1, 1, 1, ReduceOrder::ORDER_ONLY_VALUE);
-                Brcb(msumB, msumV, 1, BrcbRepeatParams(1, 8));
-                // every selected key can underflow to zero mass; the sum then acts
-                // as one so the predicted distribution stays finite
-                Maxs(msumB, msumB, 1e-30f, 8);
-                Brcb(lmaxB, lmaxV, 1, BrcbRepeatParams(1, 8));
-                Sub(tmpV, logitV, lmaxB, m);
-                Exp(tmpV, tmpV, m);
-                WholeReduceSum(lsumV, tmpV, m, 1, 1, 1, 1);
-                Ln(lsumV, lsumV, 8);
-                Add(loglV, lsumV, lmaxV, 8);
-                Brcb(loglB, loglV, 1, BrcbRepeatParams(1, 8));
-                Div(pV, massV, msumB, m);
-                Sub(tmpV, logitV, loglB, m);
-                Exp(qV, tmpV, m);
-                Sub(dIvec, qV, pV, m);
-                // p log p is taken as a limit at zero, so the term stays defined
-                Maxs(pcV, pV, 1e-30f, m);
-                Ln(lnpV, pcV, m);
-                Sub(lnpV, lnpV, tmpV, m);
-                Mul(lnpV, lnpV, pV, m);
-                WholeReduceSum(contribV, lnpV, m, 1, 1, 1, 1);
                 SyncVToS();
-                totalLoss += contribV.GetValue(0);
+                float mass[8], logit[8], di[8];
+                float msum = 0.0f, lmax = -3.4e38f;
+                for (uint32_t j = 0; j < m; ++j) {
+                    mass[j] = massV.GetValue(j);
+                    msum += mass[j];
+                    logit[j] = logitV.GetValue(j);
+                    if (logit[j] > lmax) lmax = logit[j];
                 }
+                if (!(msum > 0.0f)) msum = 1.0f;
+                float lsum = 0.0f;
+                for (uint32_t j = 0; j < m; ++j) lsum += SliExp(logit[j] - lmax);
+                float logl = lmax + SliLog(lsum);
+                for (uint32_t j = 0; j < m; ++j) {
+                    float p = mass[j]/msum;
+                    float q = SliExp(logit[j] - logl);
+                    di[j] = q - p;
+                    if (p > 0.0f) totalLoss += p*(SliLog(p) - (logit[j] - logl));
+                }
+                for (uint32_t j = 0; j < m; ++j) dIvec.SetValue(j, di[j]);
+                SyncSToV();
                 // ---- gradients ----
                 // dWeights uses the rectified similarities themselves, the two
                 // scatter terms only their sign, so the shared product carries the
