@@ -33,7 +33,11 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     FastTake(o, kp*n1p); FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, kp*nip);
     FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, nip*di); FastTake(o, nip*di);
     FastTake(o, kp*dq); FastTake(o, kp*dr); FastTake(o, kp*di);
-    FastTake(o, batches*s2*di); FastTake(o, rows*ni*di); FastTake(o, rows*ni);
+    FastTake(o, batches*s2*di); FastTake(o, rows*ni*di); FastTake(o, rows*nip0);
+    {
+        uint64_t redSpan = (uint64_t)batches*s2*di;
+        FastTake(o, tiny ? 4*redSpan + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
+    }
     uint64_t wide = s2 > kp ? s2 : kp;
     uint64_t dim = dq > dr ? dq : dr;
     if (di > dim) dim = di;
@@ -190,7 +194,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     t.fastRecompute = (t.fast && core == ge::DT_FLOAT) ? 1u : 0u;
     if (t.fast) {
         uint64_t dkElems = static_cast<uint64_t>(t.batch) * t.keyRows * t.indexDim;
-        t.batchScratch = t.cores > 1 ? (dkElems + 15) / 16 * 16 : 0;
+        t.batchScratch = t.cores > 1 ? (t.tiny ? dkElems : (dkElems + 15) / 16 * 16) : 0;
         // the merge stages every core's partial in one burst
         context->SetScheduleMode(1);
     } else {
