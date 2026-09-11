@@ -178,8 +178,9 @@ class SparseGrad {
         fOffSelKI = FastTake(o, kp*di);
         fOffDk = FastTake(o, batches*s2*di);
         fOffDq = FastTake(o, rows*ni*di);
-        fOffDw = FastTake(o, rows*ni);
-        fOffRed = FastTake(o, 4*batches*s2*di);
+        fOffDw = FastTake(o, rows*nip0);
+        uint64_t redSpan = (uint64_t)batches*s2*di;
+        fOffRed = FastTake(o, t.tiny ? 4*redSpan + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
         uint64_t wide = (s2 > kp ? s2 : kp);
         uint64_t dim = dq > dr ? dq : dr;
         if (di > dim) dim = di;
@@ -446,6 +447,42 @@ public:
             DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(loss);
         }
     }
+    // Fold every core's partial into one span-long accumulator.  The merge target
+    // only holds a few slots, so the partials arrive in bursts and each burst is
+    // folded down before the next one lands.
+    __aicore__ inline LocalTensor<float> MergePartials(LocalTensor<float> base, uint32_t cores,
+                                                       uint32_t span, uint32_t slot) {
+        LocalTensor<float> sum = base[fOffRed];
+        LocalTensor<float> buf = base[fOffRed][span];
+        const uint32_t chunk = 3u;
+        bool folded = false;
+        for (uint32_t done = 0; done < cores; done += chunk) {
+            uint32_t take = cores - done < chunk ? cores - done : chunk;
+            // the previous burst is still being read while this one is set up
+            SyncVToMte2();
+            DataCopyExtParams pr{1, static_cast<uint32_t>(take*slot*sizeof(float)), 0, 0, 0};
+            DataCopyPad(buf, wsAll[(uint64_t)done*slot], pr, DataCopyPadExtParams<float>{false,0,0,0});
+            SyncMte2ToV();
+            uint32_t left = take;
+            while (left > 1) {
+                uint32_t half = left / 2;
+                Add(buf, buf, buf[(uint64_t)half*slot], half*slot);
+                if (left & 1u) {
+                    Adds(buf[(uint64_t)half*slot], buf[(uint64_t)(left - 1)*slot], 0.0f, slot);
+                    left = half + 1;
+                } else {
+                    left = half;
+                }
+            }
+            if (!folded) {
+                Adds(sum, buf, 0.0f, span);
+                folded = true;
+            } else {
+                Add(sum, sum, buf, span);
+            }
+        }
+        return sum;
+    }
     __aicore__ inline void SyncMte2ToV() {
         TEventID id = pipe->FetchEventID(HardEvent::MTE2_V);
         SetFlag<HardEvent::MTE2_V>(id);
@@ -558,7 +595,6 @@ public:
         if (first > fRows) first = fRows;
         uint32_t mine = last - first;
         // pad lanes of narrow padded rows must read as zero for later vector ops
-        Duplicate(base[fOffC], 0.0f, fRows*fN1P);
         if (!((fNIP == fNI) && (fN1P == fN1))) {
             Duplicate(base[fOffW], 0.0f, fRows*fNIP);
             Duplicate(base[fOffMax], 0.0f, fRows*fN1P);
@@ -619,7 +655,7 @@ public:
             Add(base[fOffC], base[fOffC], base[fOffMax], mine*fN1P);
         }
         Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi);
-        Duplicate(base[fOffDw], 0.0f, mine*fNI);
+        Duplicate(base[fOffDw], 0.0f, mine*fNIP);
 
         LocalTensor<float> lossAcc = base[fOffAux][1024];
         Duplicate(lossAcc, 0.0f, 8);
@@ -645,76 +681,13 @@ public:
         LocalTensor<float> selKI = base[fOffSelKI];
         uint32_t sel[64];
         float totalLoss = 0.0f;
-        bool useProvided = true;
-        if (t.fastRecompute) {
-            // The accurate reference rebuilds the visible normalizer for FP32 inputs.
-            // Provided statistics are usually the rounded exact values; probe one head
-            // and only pay for recomputation when they actually disagree.
-            useProvided = false;
-            LocalTensor<float> qRowBase = base[fOffQ];
-            LocalTensor<float> qrRowBase = base[fOffQR];
-            uint32_t b0 = first / t.queryRows;
-            uint32_t r0 = first - b0*t.queryRows;
-            uint32_t qlen0 = t.empty ? 0 : Length(true, b0);
-            uint32_t klen0 = Length(false, b0);
-            int32_t vis0 = static_cast<int32_t>(r0) + static_cast<int32_t>(klen0)
-                           - static_cast<int32_t>(qlen0) + 1;
-            if (qlen0 > 0 && vis0 > 0) {
-                // A supplied (max, sum) pair is only trustworthy if the exact
-                // scores reproduce its sum when the supplied offset is applied.
-                useProvided = true;
-                // Both probed heads are scored first and every supplied statistic is
-                // read in one group: a scalar read drains the vector pipe, so six
-                // scattered reads cost six drains while two grouped reads cost two.
-                uint32_t hh[2];
-                float gMax[2], gSum[2], red[2];
-                hh[0] = 0;
-                hh[1] = fN1 > 1 ? fN1 - 1 : 0;
-                // stage the statistics through the vector unit: a scalar read of a
-                // freshly transferred buffer is not ordered against the copy
-                LocalTensor<float> statVec = base[fOffAux][960];
-                Adds(statVec, base[fOffMax], 0.0f, fN1);
-                Adds(statVec[64], base[fOffSum], 0.0f, fN1);
-                SyncVToS();
-                for (uint32_t t2 = 0; t2 < 2; ++t2) {
-                    gMax[t2] = statVec[hh[t2]].GetValue(0);
-                    gSum[t2] = statVec[64 + hh[t2]].GetValue(0);
-                }
-                for (uint32_t t2 = 0; t2 < 2; ++t2) {
-                    uint32_t h = hh[t2];
-                    Mul(prod, base[fOffKey], qRowBase[h*fDq], fDq, vis0,
-                        BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
-                    WholeReduceSum(work, prod, fDq, vis0, 1, 1, fDq/8);
-                    Mul(prod, base[fOffKeyR], qrRowBase[h*fDr], fDr, vis0,
-                        BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
-                    WholeReduceSum(work[64], prod, fDr, vis0, 1, 1, fDr/8);
-                    Add(work, work, work[64], vis0);
-                    Adds(work, work, -gMax[t2], vis0);
-                    Exp(work, work, vis0);
-                    WholeReduceSum(work[128 + t2*64], work, vis0, 1, 1, 1, 1);
-                }
-                for (uint32_t t2 = 0; t2 < 2; ++t2)
-                    red[t2] = work[128 + t2*64].GetValue(0);
-                for (uint32_t t2 = 0; t2 < 2 && useProvided; ++t2) {
-                    // A supplied (max, sum) pair is trusted while it stays within a
-                    // per-cent of the exact normalizer. Statistics rounded by a
-                    // half-precision forward pass land near 5e-4 and only rescale each
-                    // head's distribution, which cancels in the selected renormalization;
-                    // larger disagreements mean the pair belongs to a different window.
-                    float diff = red[t2] - gSum[t2];
-                    if (diff < 0) diff = -diff;
-                    float bound = 1e-2f * (gSum[t2] > 0 ? gSum[t2] : -gSum[t2]);
-                    useProvided = diff <= (bound > 1e-3f ? bound : 1e-3f);
-                }
-            }
-            if (useProvided) {
-                Ln(base[fOffC], base[fOffSum], fRows*fN1P);
-                Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
-            }
-        }
+        // The supplied statistics may come from a lower-precision forward pass and
+        // then no longer reproduce the exact visible normalizer, so the FP32 path
+        // rebuilds every head's normalizer over the visible window instead.
+        bool useProvided = !t.fastRecompute;
         Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
         if (mine) Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi);
-        Duplicate(base[fOffDw], 0.0f, fRows*fNI);
+        Duplicate(base[fOffDw], 0.0f, fRows*fNIP);
         for (uint32_t b = 0; b < t.batch; ++b) {
             uint32_t qlen = t.empty ? 0 : Length(true, b);
             uint32_t klen = Length(false, b);
@@ -736,7 +709,7 @@ public:
                 LocalTensor<float> qrRow = base[fOffQR][(uint64_t)local*fN1*fDr];
                 LocalTensor<float> qiRow = base[fOffQI][(uint64_t)local*fNI*fDi];
                 LocalTensor<float> dqRow = base[fOffDq][(uint64_t)local*fNI*fDi];
-                LocalTensor<float> dwRow = base[fOffDw][(uint64_t)local*fNI];
+                LocalTensor<float> dwRow = base[fOffDw][(uint64_t)local*fNIP];
                 LocalTensor<float> wRow = base[fOffW][(uint64_t)local*fNIP];
                 LocalTensor<float> cRow = base[fOffC][(uint64_t)local*fN1P];
                 // ---- target mass over the selected keys ----
@@ -882,7 +855,13 @@ public:
         // ---- publish this core's share ----
         if (mine) {
             FastStore(dq, (uint64_t)first*fNI*fDi, base[fOffDq], mine*fNI*fDi);
-            FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
+            if (fNIP == fNI) {
+                FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
+            } else {
+                // padded rows cannot be published as one contiguous block
+                for (uint32_t r = 0; r < mine; ++r)
+                    FastStore(dw, (uint64_t)(first + r)*fNI, base[fOffDw][(uint64_t)r*fNIP], fNI);
+            }
         }
         WholeReduceSum(work[64], lossAcc, 1, 1, 1, 1, 1);
         float myLoss = totalLoss + work[64].GetValue(0);
@@ -900,16 +879,18 @@ public:
                 // other cores' partials must come from GM, not from this core's cache
                 DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(wsAll);
                 PipeBarrier<PIPE_ALL>();
-                LocalTensor<float> acc = base[fOffRed];
-                DataCopyExtParams pr{1, static_cast<uint32_t>(cores*keys*fDi*sizeof(float)), 0, 0, 0};
-                DataCopyPad(acc, wsAll[0], pr, DataCopyPadExtParams<float>{false,0,0,0});
-                SyncMte2ToV();
                 uint32_t span = keys*fDi;
-                for (uint32_t c = 1; c < cores; ++c)
-                    Add(acc, acc, acc[(uint64_t)c*span], span);
-                FastStore(dk, 0, acc, keys*fDi);
+                uint32_t slot = t.batchScratch ? t.batchScratch : span;
+                LocalTensor<float> acc = MergePartials(base, cores, span, slot);
+                FastStore(dk, 0, acc, span);
+                // the loss shares come back along with the partials
+                LocalTensor<float> lossBuf = base[fOffAux];
+                DataCopyExtParams pl{1, static_cast<uint32_t>(cores*16*sizeof(float)), 0, 0, 0};
+                DataCopyPad(lossBuf, losses, pl, DataCopyPadExtParams<float>{false,0,0,0});
+                SyncMte2ToV();
+                SyncVToS();
                 float total = 0;
-                for (uint32_t c = 0; c < cores; ++c) total += losses.GetValue(c*16);
+                for (uint32_t c = 0; c < cores; ++c) total += lossBuf[c*16].GetValue(0);
                 loss.SetValue(0, total);
                 DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
             }
@@ -997,7 +978,7 @@ public:
         Muls(base[fOffQ], base[fOffQ], t.scale, mine*fN1*fDq);
         Muls(base[fOffQR], base[fOffQR], t.scale, mine*fN1*fDr);
         Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
-        if (mine) { Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi); Duplicate(base[fOffDw], 0.0f, fRows*fNI); }
+        if (mine) { Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi); Duplicate(base[fOffDw], 0.0f, fRows*fNIP); }
         if (!t.fastRecompute) {
             Ln(base[fOffC], base[fOffSum], fRows*fN1P);
             Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
@@ -1006,7 +987,6 @@ public:
         LocalTensor<float> dIvec = base[fOffAux][128];
         LocalTensor<float> massV = base[fOffAux][256];
         LocalTensor<float> logitV = base[fOffAux][256 + fKP];
-        LocalTensor<float> dkAcc = base[fOffDkProd];
         LocalTensor<float> dsspr = base[fOffDsSpr];
         LocalTensor<float> dispr = base[fOffDiSpr];
         LocalTensor<float> prod = base[fOffProd];
@@ -1018,58 +998,10 @@ public:
         LocalTensor<float> dqRow = base[fOffDq];
         uint32_t sel[8];
         float totalLoss = 0.0f;
-        bool useProvided = true;
-        if (t.fastRecompute) {
-            useProvided = false;
-            uint32_t b0 = first / t.queryRows;
-            uint32_t r0 = first - b0*t.queryRows;
-            uint32_t qlen0 = t.empty ? 0 : Length(true, b0);
-            uint32_t klen0 = Length(false, b0);
-            int32_t vis0 = static_cast<int32_t>(r0) + static_cast<int32_t>(klen0)
-                           - static_cast<int32_t>(qlen0) + 1;
-            if (qlen0 > 0 && vis0 > 0) {
-                useProvided = true;
-                uint32_t hh[2];
-                float gMax[2], gSum[2], red[2];
-                hh[0] = 0;
-                hh[1] = fN1 > 1 ? fN1 - 1 : 0;
-                // stage the statistics through the vector unit: a scalar read of a
-                // freshly transferred buffer is not ordered against the copy
-                LocalTensor<float> statVec = base[fOffAux][960];
-                Adds(statVec, base[fOffMax], 0.0f, fN1);
-                Adds(statVec[64], base[fOffSum], 0.0f, fN1);
-                SyncVToS();
-                for (uint32_t t2 = 0; t2 < 2; ++t2) {
-                    gMax[t2] = statVec[hh[t2]].GetValue(0);
-                    gSum[t2] = statVec[64 + hh[t2]].GetValue(0);
-                }
-                for (uint32_t t2 = 0; t2 < 2; ++t2) {
-                    uint32_t h = hh[t2];
-                    Mul(prod, base[fOffKey], base[fOffQ][h*fDq], fDq, vis0,
-                        BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
-                    WholeReduceSum(lossVec, prod, fDq, vis0, 1, 1, fDq/8);
-                    Mul(prod, base[fOffKeyR], base[fOffQR][h*fDr], fDr, vis0,
-                        BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
-                    WholeReduceSum(lossVec[64], prod, fDr, vis0, 1, 1, fDr/8);
-                    Add(lossVec, lossVec, lossVec[64], vis0);
-                    Adds(lossVec, lossVec, -gMax[t2], vis0);
-                    Exp(lossVec, lossVec, vis0);
-                    WholeReduceSum(lossVec[128 + t2*64], lossVec, vis0, 1, 1, 1, 1);
-                }
-                for (uint32_t t2 = 0; t2 < 2; ++t2)
-                    red[t2] = lossVec[128 + t2*64].GetValue(0);
-                for (uint32_t t2 = 0; t2 < 2 && useProvided; ++t2) {
-                    float diff = red[t2] - gSum[t2];
-                    if (diff < 0) diff = -diff;
-                    float bound = 1e-2f * (gSum[t2] > 0 ? gSum[t2] : -gSum[t2]);
-                    useProvided = diff <= (bound > 1e-3f ? bound : 1e-3f);
-                }
-            }
-            if (useProvided) {
-                Ln(base[fOffC], base[fOffSum], fRows*fN1P);
-                Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
-            }
-        }
+        // The supplied statistics may come from a lower-precision forward pass and
+        // then no longer reproduce the exact visible normalizer, so the FP32 path
+        // rebuilds every head's normalizer over the visible window instead.
+        bool useProvided = !t.fastRecompute;
         for (uint32_t b = 0; b < t.batch; ++b) {
             uint32_t qlen = t.empty ? 0 : Length(true, b);
             uint32_t klen = Length(false, b);
@@ -1090,7 +1022,7 @@ public:
                 LocalTensor<float> qRow = base[fOffQ][(uint64_t)local*fN1*fDq];
                 LocalTensor<float> qrRow = base[fOffQR][(uint64_t)local*fN1*fDr];
                 LocalTensor<float> qiRow = base[fOffQI][(uint64_t)local*fNI*fDi];
-                LocalTensor<float> dwRow = base[fOffDw][(uint64_t)local*fNI];
+                LocalTensor<float> dwRow = base[fOffDw][(uint64_t)local*fNIP];
                 LocalTensor<float> wRow = base[fOffW][(uint64_t)local*fNIP];
                 LocalTensor<float> cRow = base[fOffC][(uint64_t)local*fN1P];
                 LocalTensor<float> dqOut = dqRow[(uint64_t)local*fNI*fDi];
@@ -1180,23 +1112,27 @@ public:
                 MulAddDst(dwRow, sim, dispr, fNI, (uint8_t)m,
                           BinaryRepeatParams(1, 1, 0, 0, fNIP/8, 1));
                 Brcb(dsspr, ds, (uint8_t)((m*fNIP)/8), BrcbRepeatParams(1, 8));
-                Duplicate(dkAcc, 0.0f, m*fDi);
+                // The key accumulator is zeroed once for the whole core, so every
+                // scatter term folds straight into its own key row.
                 for (uint32_t j = 0; j < m; ++j) {
                     uint64_t kb = (uint64_t)kbase + sel[j];
                     MulAddDst(dqOut, base[fOffKi][kb*fDi], dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
                               BinaryRepeatParams(1, 1, 0, fDi/8, 0, 1));
-                    MulAddDst(dkAcc[(uint64_t)j*fDi], qiRow, dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
+                    MulAddDst(base[fOffDk][((uint64_t)b*fS2 + sel[j])*fDi], qiRow,
+                              dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
                               BinaryRepeatParams(1, 1, 0, 0, fDi/8, 1));
-                }
-                for (uint32_t j = 0; j < m; ++j) {
-                    LocalTensor<float> dkRow = base[fOffDk][((uint64_t)b*fS2 + sel[j])*fDi];
-                    Add(dkRow, dkRow, dkAcc[(uint64_t)j*fDi], fDi);
                 }
             }
         }
         if (mine) {
             FastStore(dq, (uint64_t)first*fNI*fDi, base[fOffDq], mine*fNI*fDi);
-            FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
+            if (fNIP == fNI) {
+                FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
+            } else {
+                // padded rows cannot be published as one contiguous block
+                for (uint32_t r = 0; r < mine; ++r)
+                    FastStore(dw, (uint64_t)(first + r)*fNI, base[fOffDw][(uint64_t)r*fNIP], fNI);
+            }
         }
         PublishTiny(totalLoss);
     }
@@ -1206,33 +1142,26 @@ public:
         uint32_t keys = static_cast<uint32_t>((uint64_t)t.batch*fS2);
         uint32_t cores = t.cores ? t.cores : 1u;
         if (cores > 1) {
-            DataCopyExtParams pw{1, static_cast<uint32_t>(keys*fDi*sizeof(float)), 0, 0, 0};
+            uint32_t span = keys*fDi;
+            uint32_t slot = t.batchScratch ? t.batchScratch : span;
+            DataCopyExtParams pw{1, static_cast<uint32_t>(span*sizeof(float)), 0, 0, 0};
             SyncVToMte3();
             DataCopyPad(scratch, base[fOffDk], pw);
             losses.SetValue(GetBlockIdx()*16, myLoss);
             DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(losses);
             SyncAll();
             if (GetBlockIdx() == 0) {
-                LocalTensor<float> acc = base[fOffRed];
-                DataCopyExtParams pr{1, static_cast<uint32_t>(cores*keys*fDi*sizeof(float)), 0, 0, 0};
-                DataCopyPad(acc, wsAll[0], pr, DataCopyPadExtParams<float>{false,0,0,0});
+                LocalTensor<float> acc = MergePartials(base, cores, span, slot);
+                FastStore(dk, 0, acc, span);
+                // every core's loss share comes back in one burst instead of one
+                // uncached scalar read per core
+                LocalTensor<float> lossBuf = base[fOffAux];
+                DataCopyExtParams pl{1, static_cast<uint32_t>(cores*16*sizeof(float)), 0, 0, 0};
+                DataCopyPad(lossBuf, losses, pl, DataCopyPadExtParams<float>{false,0,0,0});
                 SyncMte2ToV();
-                // pairwise folding: halve the number of live partials per step
-                uint32_t span = keys*fDi;
-                uint32_t left = cores;
-                while (left > 1) {
-                    uint32_t half = left / 2;
-                    Add(acc, acc, acc[(uint64_t)half*span], half*span);
-                    if (left & 1u) {
-                        Adds(acc[(uint64_t)half*span], acc[(uint64_t)(left - 1)*span], 0.0f, span);
-                        left = half + 1;
-                    } else {
-                        left = half;
-                    }
-                }
-                FastStore(dk, 0, acc, keys*fDi);
+                SyncVToS();
                 float total = 0;
-                for (uint32_t c = 0; c < cores; ++c) total += losses.GetValue(c*16);
+                for (uint32_t c = 0; c < cores; ++c) total += lossBuf[c*16].GetValue(0);
                 loss.SetValue(0, total);
                 DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
             }
