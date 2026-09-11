@@ -16,7 +16,7 @@ static uint64_t FastTake(uint64_t &cursor, uint64_t count) {
     cursor += count + 64;
     return at;
 }
-static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool stageQR, bool stageKR) {
+static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool stageQR, bool stageKR, bool tiny) {
     uint64_t rows = static_cast<uint64_t>(t.batch) * t.queryRows;
     uint64_t n1 = t.queryHeads, ni = t.indexHeads;
     uint64_t dq = t.queryDim, dr = t.ropeDim, di = t.indexDim;
@@ -44,6 +44,11 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     FastTake(o, prodNeed);
     FastTake(o, 2048);
     FastTake(o, rows*k);
+    if (tiny) {
+        FastTake(o, kp*nip*di);
+        FastTake(o, 8*kp*nip);
+        FastTake(o, 8*kp);
+    }
     uint64_t stg = (o + 7) / 8 * 8;
     if (stageT) stg = (stg + rows*n1*dq + 7) / 8 * 8;
     if (stageQR) stg = (stg + rows*n1*dr + 7) / 8 * 8;
@@ -55,6 +60,22 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     return stg + 64;
 }
 static bool PowerOfTwo(uint32_t n) { return n && !(n & (n - 1)); }
+// The tiny path keeps one row of work per vector core and contracts every dot
+// with a single broadcast multiply, so it needs the rope block to fold into the
+// head rows and a bounded number of selected keys.
+static bool TinyEligible(const Tiling &t) {
+    if (t.empty || t.statsLayout != 0) return false;
+    if (t.queryDim % 8 || t.ropeDim % 8 || t.indexDim % 8) return false;
+    if (t.queryDim < 8 || t.ropeDim < 8 || t.indexDim < 8) return false;
+    if (t.queryDim > 64 || t.ropeDim > 64 || t.indexDim > 64) return false;
+    if (t.ropeDim > t.queryDim) return false;
+    if (t.sparseSize < 1 || t.sparseSize > 8) return false;
+    if (t.queryHeads < 1 || t.queryHeads > 64) return false;
+    if (t.indexHeads < 1 || t.indexHeads > 64) return false;
+    if (t.keyRows < 1 || t.keyRows > 64) return false;
+    if (static_cast<uint64_t>(t.batch) * t.queryRows > 8) return false;
+    return true;
+}
 static bool FastEligible(const Tiling &t, bool stageT, bool stageW, bool stageQR, bool stageKR) {
     if (t.empty || t.statsLayout != 0) return false;
     if (t.queryDim % 8 || t.ropeDim % 8 || t.indexDim % 8) return false;
@@ -66,7 +87,7 @@ static bool FastEligible(const Tiling &t, bool stageT, bool stageW, bool stageQR
     if (t.queryHeads < 1 || t.queryHeads > 64 || t.indexHeads < 1 || t.indexHeads > 64) return false;
     if (t.keyRows < 1 || t.keyRows > 64 || t.sparseSize < 1 || t.sparseSize > 64) return false;
     if (static_cast<uint64_t>(t.batch) * t.queryRows > 32) return false;
-    return FastLayoutFloats(t, stageT, stageW, stageQR, stageKR) * sizeof(float) <= 168u * 1024u;
+    return FastLayoutFloats(t, stageT, stageW, stageQR, stageKR, t.tiny != 0) * sizeof(float) <= 168u * 1024u;
 }
 static bool Floating(ge::DataType type) {
     return type == ge::DT_FLOAT || type == ge::DT_FLOAT16 || type == ge::DT_BF16;
@@ -152,8 +173,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     uint32_t fastRows = static_cast<uint32_t>(t.batch) * t.queryRows;
     uint32_t fastCores = fastRows < 8u ? fastRows : 8u;
     t.cores = fastCores ? fastCores : 1u;
+    t.tiny = TinyEligible(t) ? 1u : 0u;
     t.fast = FastEligible(t, core != ge::DT_FLOAT, wt != ge::DT_FLOAT,
                           in[8]->GetDataType() != ge::DT_FLOAT, in[9]->GetDataType() != ge::DT_FLOAT) ? 1u : 0u;
+    if (!t.fast) t.tiny = 0;
     // FP32 fixtures may carry statistics from a lower-precision forward pass; the
     // accurate reference rebuilds the visible normalizer, so mirror it on device.
     t.fastRecompute = (t.fast && core == ge::DT_FLOAT) ? 1u : 0u;
