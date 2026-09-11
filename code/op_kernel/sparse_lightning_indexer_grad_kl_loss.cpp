@@ -126,7 +126,7 @@ class SparseGrad {
     uint64_t fOffQ, fOffQR, fOffQI, fOffW, fOffMax, fOffSum, fOffC;
     uint64_t fOffKey, fOffKeyR, fOffKi, fOffSim, fOffSelK, fOffSelKR, fOffSelKI;
     uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx, fOffRed;
-    uint64_t fOffDkProd, fOffDsSpr, fOffDiSpr;
+    uint64_t fOffDkProd, fOffDsSpr, fOffDiSpr, fOffHeadScr;
     GlobalTensor<float> wsAll;
     uint64_t fOffSco, fOffPos, fOffDiMat, fOffV, fOffU, fOffUmat, fOffDqAcc, fOffWStage;
     uint32_t fWStageStride;
@@ -196,8 +196,9 @@ class SparseGrad {
             fOffDkProd = FastTake(o, kp*nip*di);
             fOffDsSpr = FastTake(o, 8*kp*nip);
             fOffDiSpr = FastTake(o, 8*kp);
+            fOffHeadScr = FastTake(o, n1p*((s2 + 7) / 8 * 8));
         } else {
-            fOffDkProd = 0; fOffDsSpr = 0; fOffDiSpr = 0;
+            fOffDkProd = 0; fOffDsSpr = 0; fOffDiSpr = 0; fOffHeadScr = 0;
         }
         // One staging slice per input tensor lets every transfer be issued before a
         // single wait; slices only need 32B alignment.
@@ -1081,24 +1082,34 @@ public:
                 LocalTensor<float> cRow = base[fOffC][(uint64_t)local*fN1P];
                 LocalTensor<float> dqOut = dqRow[(uint64_t)local*fNI*fDi];
                 if (!useProvided && visible > 0) {
-                    LocalTensor<float> keyB = base[fOffKey][(uint64_t)b*fS2*fDq];
-                    LocalTensor<float> keyRB = base[fOffKeyR][(uint64_t)b*fS2*fDr];
+                    // Stage every head's window scores in one matrix so the head
+                    // reductions become a single strided pass and the shift can be
+                    // shared by all heads.
+                    LocalTensor<float> keyB = base[fOffKey][(uint64_t)kbase*fS2*fDq];
+                    LocalTensor<float> keyRB = base[fOffKeyR][(uint64_t)kbase*fS2*fDr];
+                    LocalTensor<float> hSc = base[fOffHeadScr];
+                    uint32_t vis = static_cast<uint32_t>(visible);
+                    uint32_t s2p = (fS2 + 7) / 8 * 8;
+                    uint32_t hstride = s2p / 8;
                     for (uint32_t h = 0; h < fN1; ++h) {
-                        Mul(prod, keyB, qRow[h*fDq], fDq, visible,
-                            BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
-                        WholeReduceSum(lossVec, prod, fDq, visible, 1, 1, fDq/8);
-                        Mul(prod, keyRB, qrRow[h*fDr], fDr, visible,
-                            BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
-                        WholeReduceSum(lossVec[64], prod, fDr, visible, 1, 1, fDr/8);
-                        Add(lossVec, lossVec, lossVec[64], visible);
-                        WholeReduceMax(lossVec[128], lossVec, visible, 1, 1, 1, 1,
-                                       ReduceOrder::ORDER_ONLY_VALUE);
-                        float mx = lossVec[128].GetValue(0);
-                        Adds(lossVec, lossVec, -mx, visible);
-                        Exp(lossVec, lossVec, visible);
-                        WholeReduceSum(lossVec[64], lossVec, visible, 1, 1, 1, 1);
-                        cRow.SetValue(h, mx + SliLog(lossVec[64].GetValue(0)));
+                        // the rope block folds straight into the first lanes of the
+                        // head rows, so one primitive and one reduce score a head
+                        Mul(prod, keyB, qRow[h*fDq], fDq, vis,
+                            BinaryRepeatParams(1, 1, 1, fDq/8, fDq/8, 0));
+                        MulAddDst(prod, keyRB, qrRow[h*fDr], fDr, vis,
+                                  BinaryRepeatParams(1, 1, 1, fDq/8, fDr/8, 0));
+                        WholeReduceSum(hSc[h*s2p], prod, fDq, vis, 1, 1, fDq/8);
                     }
+                    WholeReduceMax(lossVec[128], hSc, vis, (uint8_t)fN1, 1, 1, hstride,
+                                   ReduceOrder::ORDER_ONLY_VALUE);
+                    WholeReduceMax(lossVec[192], lossVec[128], fN1, 1, 1, 1, 1,
+                                   ReduceOrder::ORDER_ONLY_VALUE);
+                    float gmx = lossVec[192].GetValue(0);
+                    Adds(hSc, hSc, -gmx, vis, (uint8_t)fN1, UnaryRepeatParams(1, 1, hstride, hstride));
+                    Exp(hSc, hSc, vis, (uint8_t)fN1, UnaryRepeatParams(1, 1, hstride, hstride));
+                    WholeReduceSum(lossVec[128], hSc, vis, (uint8_t)fN1, 1, 1, hstride);
+                    Ln(lossVec[128], lossVec[128], fN1);
+                    Adds(cRow, lossVec[128], gmx, fN1);
                 }
                 // ---- main scores and indexer similarities at the selected keys ----
                 for (uint32_t j = 0; j < m; ++j) {
