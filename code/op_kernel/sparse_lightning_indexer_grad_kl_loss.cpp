@@ -1296,14 +1296,19 @@ public:
             // the epoch transfer was issued with the preamble, so it is long settled
             PipeBarrier<PIPE_ALL>();
             uint32_t epoch = auxWords.GetValue(kEpochLane);
-            // leave this core's partial, its loss share and a ready stamp in one
-            // transfer; the reader below picks the loss and the stamp out of the poll
-            base[fOffDk].ReinterpretCast<uint32_t>().SetValue(span + 1, SliStamp(epoch, GetBlockIdx()));
-            Duplicate(base[fOffDk][span], myLoss, 1);
-            SyncSToMte3();
-            SyncVToMte3();
-            DataCopyExtParams pw{1, static_cast<uint32_t>((span + 2)*sizeof(float)), 0, 0, 0};
+            // The partial goes out on its own, and the loss lane with the ready stamp
+            // follows in a second transfer.  A reader that sees the stamp can then
+            // trust the partial: the segments of a single burst are not guaranteed to
+            // land in order, but queued transfers are issued in order.
+            DataCopyExtParams pw{1, static_cast<uint32_t>(span*sizeof(float)), 0, 0, 0};
             DataCopyPad(scratch, base[fOffDk], pw);
+            Duplicate(base[fOffDk][span], myLoss, 1);
+            base[fOffDk].ReinterpretCast<uint32_t>().SetValue(span + 1, SliStamp(epoch, GetBlockIdx()));
+            SyncVToMte3();
+            SyncSToMte3();
+            // a full 32B block, so the closing transfer keeps the copy granularity
+            DataCopyExtParams pz{1, 8*sizeof(float), 0, 0, 0};
+            DataCopyPad(scratch[span], base[fOffDk][span], pz);
             if (GetBlockIdx() == 0) {
                 // One copy brings in every core's partial together with the loss lane
                 // and the ready stamp that closes it, so the fold waits on a single
