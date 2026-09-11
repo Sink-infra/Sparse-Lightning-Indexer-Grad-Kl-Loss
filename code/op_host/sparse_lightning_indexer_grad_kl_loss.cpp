@@ -36,7 +36,7 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     FastTake(o, batches*s2*di); FastTake(o, rows*ni*di); FastTake(o, rows*nip0);
     {
         uint64_t redSpan = (uint64_t)batches*s2*di;
-        FastTake(o, tiny ? 4*redSpan + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
+        FastTake(o, tiny ? 4*(redSpan + 8) + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
     }
     uint64_t wide = s2 > kp ? s2 : kp;
     uint64_t dim = dq > dr ? dq : dr;
@@ -194,7 +194,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     t.fastRecompute = (t.fast && core == ge::DT_FLOAT) ? 1u : 0u;
     if (t.fast) {
         uint64_t dkElems = static_cast<uint64_t>(t.batch) * t.keyRows * t.indexDim;
-        t.batchScratch = t.cores > 1 ? (t.tiny ? dkElems : (dkElems + 15) / 16 * 16) : 0;
+        // the tiny slot keeps one spare lane for the core's loss share
+        t.batchScratch = t.cores > 1 ? (t.tiny ? dkElems + 8 : (dkElems + 15) / 16 * 16) : 0;
         // the merge stages every core's partial in one burst
         context->SetScheduleMode(1);
     } else {
