@@ -576,6 +576,44 @@ public:
         }
     }
 
+    // Publish the query gradient and the weight gradient.  When both carry the core
+    // dtype they share one staging pass, so the pipeline drains once for the pair
+    // instead of once per output; padded weight rows are narrowed on the way out.
+    __aicore__ inline void StoreRowGradients(uint64_t first, uint32_t mine) {
+        if (mine == 0) return;
+        uint32_t qCount = mine*fNI*fDi;
+        uint32_t wCount = mine*fNIP;
+        if constexpr (AscendC::IsSameType<T,W>::value) {
+            if (qCount + wCount <= fStgQElems && (mine <= 1 || fNIP % 16 == 0)) {
+                if constexpr (AscendC::IsSameType<T,float>::value) {
+                    SyncVToMte3();
+                    DataCopyExtParams pq{1, static_cast<uint32_t>(qCount*sizeof(float)), 0, 0, 0};
+                    DataCopyPad(dq[first*fNI*fDi], a[fOffDq], pq);
+                    for (uint32_t r = 0; r < mine; ++r) {
+                        DataCopyExtParams pw{1, static_cast<uint32_t>(fNI*sizeof(float)), 0, 0, 0};
+                        DataCopyPad(dw[(first + r)*fNI], a[fOffDw][(uint64_t)r*fNIP], pw);
+                    }
+                } else {
+                    auto stage = a[fStgQ].ReinterpretCast<T>();
+                    SyncMte3ToV();
+                    Cast(stage, a[fOffDq], RoundMode::CAST_RINT, static_cast<int32_t>(qCount));
+                    Cast(stage[qCount], a[fOffDw], RoundMode::CAST_RINT, static_cast<int32_t>(wCount));
+                    SyncVToMte3();
+                    DataCopyExtParams pq{1, static_cast<uint32_t>(qCount*sizeof(T)), 0, 0, 0};
+                    DataCopyPad(dq[first*fNI*fDi], stage, pq);
+                    for (uint32_t r = 0; r < mine; ++r) {
+                        DataCopyExtParams pw{1, static_cast<uint32_t>(fNI*sizeof(T)), 0, 0, 0};
+                        DataCopyPad(dw[(first + r)*fNI], stage[qCount + (uint64_t)r*fNIP], pw);
+                    }
+                }
+                return;
+            }
+        }
+        FastStore(dq, first*fNI*fDi, a[fOffDq], qCount);
+        for (uint32_t r = 0; r < mine; ++r)
+            FastStore(dw, (first + r)*fNI, a[fOffDw][(uint64_t)r*fNIP], fNI);
+    }
+
     // Sum the rows of a (rows x width) matrix into row 0; rows must be a power of two.
     __aicore__ inline LocalTensor<float> SumRows(LocalTensor<float> a0, LocalTensor<float> a1,
                                                  uint32_t rows, uint32_t width) {
@@ -861,16 +899,7 @@ public:
             }
         }
         // ---- publish this core's share ----
-        if (mine) {
-            FastStore(dq, (uint64_t)first*fNI*fDi, base[fOffDq], mine*fNI*fDi);
-            if (fNIP == fNI) {
-                FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
-            } else {
-                // padded rows cannot be published as one contiguous block
-                for (uint32_t r = 0; r < mine; ++r)
-                    FastStore(dw, (uint64_t)(first + r)*fNI, base[fOffDw][(uint64_t)r*fNIP], fNI);
-            }
-        }
+        if (mine) StoreRowGradients(first, mine);
         WholeReduceSum(work[64], lossAcc, 1, 1, 1, 1, 1);
         float myLoss = totalLoss + work[64].GetValue(0);
         if (cores > 1) {
@@ -1145,16 +1174,7 @@ public:
                 }
             }
         }
-        if (mine) {
-            FastStore(dq, (uint64_t)first*fNI*fDi, base[fOffDq], mine*fNI*fDi);
-            if (fNIP == fNI) {
-                FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
-            } else {
-                // padded rows cannot be published as one contiguous block
-                for (uint32_t r = 0; r < mine; ++r)
-                    FastStore(dw, (uint64_t)(first + r)*fNI, base[fOffDw][(uint64_t)r*fNIP], fNI);
-            }
-        }
+        if (mine) StoreRowGradients(first, mine);
         PublishTiny(totalLoss);
     }
     // Publish this core's share of the merged gradient and of the loss.
