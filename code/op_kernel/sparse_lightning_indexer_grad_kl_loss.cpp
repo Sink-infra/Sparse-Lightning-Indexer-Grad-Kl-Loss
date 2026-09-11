@@ -641,7 +641,19 @@ public:
                 // A supplied (max, sum) pair is only trustworthy if the exact
                 // scores reproduce its sum when the supplied offset is applied.
                 useProvided = true;
-                for (uint32_t h = 0; h < fN1 && useProvided; h += (fN1 > 1 ? fN1 - 1 : 1)) {
+                // Both probed heads are scored first and every supplied statistic is
+                // read in one group: a scalar read drains the vector pipe, so six
+                // scattered reads cost six drains while two grouped reads cost two.
+                uint32_t hh[2];
+                float gMax[2], gSum[2], red[2];
+                hh[0] = 0;
+                hh[1] = fN1 > 1 ? fN1 - 1 : 0;
+                for (uint32_t t2 = 0; t2 < 2; ++t2) {
+                    gMax[t2] = base[fOffMax].GetValue(hh[t2]);
+                    gSum[t2] = base[fOffSum].GetValue(hh[t2]);
+                }
+                for (uint32_t t2 = 0; t2 < 2; ++t2) {
+                    uint32_t h = hh[t2];
                     Mul(prod, base[fOffKey], qRowBase[h*fDq], fDq, vis0,
                         BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
                     WholeReduceSum(work, prod, fDq, vis0, 1, 1, fDq/8);
@@ -649,19 +661,21 @@ public:
                         BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
                     WholeReduceSum(work[64], prod, fDr, vis0, 1, 1, fDr/8);
                     Add(work, work, work[64], vis0);
-                    float givenMax = base[fOffMax].GetValue(h);
-                    float givenSum = base[fOffSum].GetValue(h);
-                    Adds(work, work, -givenMax, vis0);
+                    Adds(work, work, -gMax[t2], vis0);
                     Exp(work, work, vis0);
-                    WholeReduceSum(work[64], work, vis0, 1, 1, 1, 1);
-                    float diff = work[64].GetValue(0) - givenSum;
-                    if (diff < 0) diff = -diff;
+                    WholeReduceSum(work[128 + t2*64], work, vis0, 1, 1, 1, 1);
+                }
+                for (uint32_t t2 = 0; t2 < 2; ++t2)
+                    red[t2] = work[128 + t2*64].GetValue(0);
+                for (uint32_t t2 = 0; t2 < 2 && useProvided; ++t2) {
                     // A supplied (max, sum) pair is trusted while it stays within a
                     // per-cent of the exact normalizer. Statistics rounded by a
                     // half-precision forward pass land near 5e-4 and only rescale each
                     // head's distribution, which cancels in the selected renormalization;
                     // larger disagreements mean the pair belongs to a different window.
-                    float bound = 1e-2f * (givenSum > 0 ? givenSum : -givenSum);
+                    float diff = red[t2] - gSum[t2];
+                    if (diff < 0) diff = -diff;
+                    float bound = 1e-2f * (gSum[t2] > 0 ? gSum[t2] : -gSum[t2]);
                     useProvided = diff <= (bound > 1e-3f ? bound : 1e-3f);
                 }
             }
