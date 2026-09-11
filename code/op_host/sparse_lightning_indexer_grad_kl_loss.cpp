@@ -30,13 +30,23 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     FastTake(o, rows*wStage);
     FastTake(o, batches*s2*dq); FastTake(o, batches*s2*dr); FastTake(o, batches*s2*di);
     uint64_t n1p = (n1 + 7) / 8 * 8, nip = (ni + 7) / 8 * 8;
-    FastTake(o, kp*n1p); FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, kp*nip);
-    FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, nip*di); FastTake(o, nip*di);
-    FastTake(o, kp*dq); FastTake(o, kp*dr); FastTake(o, kp*di);
+    FastTake(o, kp*n1p);
+    if (tiny) {
+        // the tiny path keeps only the per-key score, similarity, indicator and
+        // scaled-indicator stacks; the fast path's extra product stacks, head
+        // copies and block spreads are contracted a key at a time instead
+        FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, kp*nip);
+    } else {
+        FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, kp*nip);
+        FastTake(o, kp*nip); FastTake(o, kp*nip); FastTake(o, nip*di); FastTake(o, nip*di);
+        FastTake(o, kp*dq); FastTake(o, kp*dr); FastTake(o, kp*di);
+    }
     FastTake(o, batches*s2*di); FastTake(o, rows*ni*di); FastTake(o, rows*nip0);
     {
         uint64_t redSpan = (uint64_t)batches*s2*di;
-        FastTake(o, tiny ? 4*(redSpan + 8) + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
+        // the row-split merge stages every core's partial in one burst, so the
+        // accumulator slab holds one slot per participating core plus the sum
+        FastTake(o, tiny ? (t.cores + 1)*(redSpan + 8) + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
     }
     uint64_t wide = s2 > kp ? s2 : kp;
     uint64_t dim = dq > dr ? dq : dr;
@@ -49,7 +59,6 @@ static uint64_t FastLayoutFloats(const Tiling &t, bool stageT, bool stageW, bool
     FastTake(o, 2048);
     FastTake(o, rows*k);
     if (tiny) {
-        FastTake(o, kp*nip*di);
         FastTake(o, 8*kp*nip);
         FastTake(o, 8*kp);
         FastTake(o, n1p*((s2 + 7) / 8 * 8));
@@ -69,6 +78,9 @@ static bool PowerOfTwo(uint32_t n) { return n && !(n & (n - 1)); }
 // the extra blocks only redo the shared transfers but they shorten the critical
 // path of the cores that carry a row.
 static const uint32_t TinyCores = 8u;
+// Workspace floats reserved behind the per-core slots for the tiny path's
+// cross-core handshake: one ready word per core plus the launch epoch.
+static const uint32_t TinySyncFloats = 64u;
 // The tiny path keeps one row of work per vector core and contracts every dot
 // with a single broadcast multiply, so it needs the rope block to fold into the
 // head rows and a bounded number of selected keys.
@@ -177,18 +189,21 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         !std::isfinite(*attrs->GetFloat(0))) return ge::GRAPH_FAILED;
     t.scale = *attrs->GetFloat(0);
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    // The row-split fast path starts one vector core per row (up to eight) and merges
-    // the gradient accumulators, so its workspace slot holds one full dKeyIndex.
+    // The row-split fast path starts one vector core per row and merges the
+    // gradient accumulators, so its workspace slot holds one full dKeyIndex.
     uint32_t fastRows = static_cast<uint32_t>(t.batch) * t.queryRows;
-    uint32_t fastCores = fastRows < 8u ? fastRows : 8u;
-    t.cores = fastCores ? fastCores : 1u;
+    t.cores = fastRows ? fastRows : 1u;
     t.tiny = TinyEligible(t) ? 1u : 0u;
-    // The tiny path keeps one row of work per vector core; launching the full
-    // row budget also amortises the per-core start-up, so keep the width fixed.
+    // The tiny path keeps one row of work per vector core and lets the row owner
+    // fold the producers, so the block budget stays fixed: spreading the same work
+    // over fewer blocks lengthens every core's span by more than it saves.
     if (t.tiny) t.cores = TinyCores;
     t.fast = FastEligible(t, core != ge::DT_FLOAT, wt != ge::DT_FLOAT,
                           in[8]->GetDataType() != ge::DT_FLOAT, in[9]->GetDataType() != ge::DT_FLOAT) ? 1u : 0u;
     if (!t.fast) t.tiny = 0;
+    // The vector-only launch carries no hardware barrier; only the tiny path may
+    // split rows across cores, because it synchronizes through the workspace.
+    if (t.fast && !t.tiny) t.cores = 1u;
     // FP32 fixtures may carry statistics from a lower-precision forward pass; the
     // accurate reference rebuilds the visible normalizer, so mirror it on device.
     t.fastRecompute = (t.fast && core == ge::DT_FLOAT) ? 1u : 0u;
@@ -213,7 +228,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE);
     context->SetBlockDim(t.cores);
     context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize() +
-        (t.batchScratch * t.cores + t.cores * 16) * sizeof(float);
+        (t.batchScratch * t.cores + t.cores * 16 + TinySyncFloats) * sizeof(float);
     return ge::GRAPH_SUCCESS;
 }
 }

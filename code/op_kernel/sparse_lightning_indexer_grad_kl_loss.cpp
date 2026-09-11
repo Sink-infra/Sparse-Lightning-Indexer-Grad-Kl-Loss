@@ -35,6 +35,25 @@ __aicore__ inline void SliSum(float value, float &sum, float &correction) {
     correction = (t - sum) - y;
     sum = t;
 }
+// The tiny path runs on the vector-only launch, which carries no hardware
+// barrier, so the cores rendezvous through the workspace: every producer stamps
+// its ready word with a value derived from the launch epoch and the row owner
+// folds the partials once every stamp of this launch is visible.  Mixing the
+// epoch keeps a stamp from a previous launch from ever matching.
+__aicore__ inline uint32_t SliStamp(uint32_t epoch, uint32_t core) {
+    uint32_t v = (epoch + 1u) * 2654435761u + core * 40503u + 0x165667B1u;
+    v ^= v >> 15; v *= 2246822519u; v ^= v >> 13;
+    return v;
+}
+// Ready words sit one per core at the end of its workspace slot, the launch epoch
+// in the reserved sync span behind the slots.  Both travel through the DMA path,
+// which needs no data-cache maintenance between cores.
+constexpr uint32_t kEpochLane = 0u;
+// each 4-byte stamp occupies its own 32B block in the polling buffer
+constexpr uint32_t kStampStride = 8u;
+// spare lanes of the per-core auxiliary block: the epoch word and the poll buffer
+constexpr uint32_t kEpochLaneOffset = 832u;
+constexpr uint32_t kStampLaneOffset = 896u;
 
 // A two-float expansion retains probability residuals through cancellation.
 #pragma clang fp contract(off)
@@ -128,6 +147,8 @@ class SparseGrad {
     uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx, fOffRed;
     uint64_t fOffDkProd, fOffDsSpr, fOffDiSpr, fOffHeadScr;
     GlobalTensor<float> wsAll;
+    GlobalTensor<uint32_t> stamps;
+    GlobalTensor<uint32_t> epochWord;
     uint64_t fOffSco, fOffPos, fOffDiMat, fOffV, fOffU, fOffUmat, fOffDqAcc, fOffWStage;
     uint32_t fWStageStride;
     uint32_t fN1P, fNIP;
@@ -169,18 +190,24 @@ class SparseGrad {
         fOffSim = FastTake(o, kp*nip);
         fOffPos = FastTake(o, kp*nip);
         fOffDiMat = FastTake(o, kp*nip);
-        fOffV = FastTake(o, kp*nip);
-        fOffU = FastTake(o, kp*nip);
-        fOffUmat = FastTake(o, nip*di);
-        fOffDqAcc = FastTake(o, nip*di);
-        fOffSelK = FastTake(o, kp*dq);
-        fOffSelKR = FastTake(o, kp*dr);
-        fOffSelKI = FastTake(o, kp*di);
+        if (t.tiny) {
+            fOffV = 0; fOffU = 0; fOffUmat = 0; fOffDqAcc = 0;
+            fOffSelK = 0; fOffSelKR = 0; fOffSelKI = 0;
+        } else {
+            fOffV = FastTake(o, kp*nip);
+            fOffU = FastTake(o, kp*nip);
+            fOffUmat = FastTake(o, nip*di);
+            fOffDqAcc = FastTake(o, nip*di);
+            fOffSelK = FastTake(o, kp*dq);
+            fOffSelKR = FastTake(o, kp*dr);
+            fOffSelKI = FastTake(o, kp*di);
+        }
         fOffDk = FastTake(o, batches*s2*di);
         fOffDq = FastTake(o, rows*ni*di);
         fOffDw = FastTake(o, rows*nip0);
         uint64_t redSpan = (uint64_t)batches*s2*di;
-        fOffRed = FastTake(o, t.tiny ? 4*(redSpan + 8) + 16 : redSpan + 3*((redSpan + 15)/16*16) + 16);
+        fOffRed = FastTake(o, t.tiny ? (t.cores + 1)*(redSpan + 8) + 16
+                                     : redSpan + 3*((redSpan + 15)/16*16) + 16);
         uint64_t wide = (s2 > kp ? s2 : kp);
         uint64_t dim = dq > dr ? dq : dr;
         if (di > dim) dim = di;
@@ -194,7 +221,7 @@ class SparseGrad {
         // tiny path scratch: per-key indexer products and the block-spread copies
         // that let one iteration carry a whole vector of per-key constants
         if (t.tiny) {
-            fOffDkProd = FastTake(o, kp*nip*di);
+            fOffDkProd = 0;
             fOffDsSpr = FastTake(o, 8*kp*nip);
             fOffDiSpr = FastTake(o, 8*kp);
             fOffHeadScr = FastTake(o, n1p*((s2 + 7) / 8 * 8));
@@ -306,6 +333,10 @@ public:
         scratch.SetGlobalBuffer((__gm__ float*)workspace + GetBlockIdx()*t.batchScratch);
         wsAll.SetGlobalBuffer((__gm__ float*)workspace);
         losses.SetGlobalBuffer((__gm__ float*)workspace + t.cores*t.batchScratch);
+        uint64_t syncBase = (uint64_t)t.cores*t.batchScratch + (uint64_t)t.cores*16;
+        epochWord.SetGlobalBuffer((__gm__ uint32_t*)workspace + syncBase);
+        stamps.SetGlobalBuffer((__gm__ uint32_t*)workspace +
+            (uint64_t)t.batch*t.keyRows*t.indexDim + 1);
         stride = (t.indexDim + 7)/8*8;
         uint32_t cacheSize = t.indexHeads*stride;
         uint64_t genFloats = 2*(uint64_t)cacheSize + 512*8 + 128*4 + 64;
@@ -457,42 +488,31 @@ public:
             DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(loss);
         }
     }
-    // Fold every core's partial into one span-long accumulator.  The merge target
-    // only holds a few slots, so the partials arrive in bursts and each burst is
-    // folded down before the next one lands.
+    // The row owner folds every producer's partial in one burst: the accumulator
+    // slab holds one slot per participating core, so the fold is a log-depth tree
+    // of adds over lanes that are already in registers.
     __aicore__ inline LocalTensor<float> MergePartials(LocalTensor<float> base, uint32_t cores,
                                                        uint32_t span, uint32_t slot, uint32_t tail) {
         LocalTensor<float> sum = base[fOffRed];
         // the accumulator is one lane longer than a partial, so the read buffer has
         // to start past it or the folded loss lane would overlap the first partial
         LocalTensor<float> buf = base[fOffRed][span + 8];
-        const uint32_t chunk = 3u;
-        bool folded = false;
-        for (uint32_t done = 0; done < cores; done += chunk) {
-            uint32_t take = cores - done < chunk ? cores - done : chunk;
-            // the previous burst is still being read while this one is set up
-            SyncVToMte2();
-            DataCopyExtParams pr{1, static_cast<uint32_t>(take*slot*sizeof(float)), 0, 0, 0};
-            DataCopyPad(buf, wsAll[(uint64_t)done*slot], pr, DataCopyPadExtParams<float>{false,0,0,0});
-            SyncMte2ToV();
-            uint32_t left = take;
-            while (left > 1) {
-                uint32_t half = left / 2;
-                Add(buf, buf, buf[(uint64_t)half*slot], half*slot);
-                if (left & 1u) {
-                    Adds(buf[(uint64_t)half*slot], buf[(uint64_t)(left - 1)*slot], 0.0f, slot);
-                    left = half + 1;
-                } else {
-                    left = half;
-                }
-            }
-            if (!folded) {
-                Adds(sum, buf, 0.0f, span + tail);
-                folded = true;
+        SyncVToMte2();
+        DataCopyExtParams pr{1, static_cast<uint32_t>(cores*slot*sizeof(float)), 0, 0, 0};
+        DataCopyPad(buf, wsAll[0], pr, DataCopyPadExtParams<float>{false,0,0,0});
+        SyncMte2ToV();
+        uint32_t left = cores;
+        while (left > 1) {
+            uint32_t half = left / 2;
+            Add(buf, buf, buf[(uint64_t)half*slot], half*slot);
+            if (left & 1u) {
+                Adds(buf[(uint64_t)half*slot], buf[(uint64_t)(left - 1)*slot], 0.0f, slot);
+                left = half + 1;
             } else {
-                Add(sum, sum, buf, span + tail);
+                left = half;
             }
         }
+        Adds(sum, buf, 0.0f, span + tail);
         return sum;
     }
     __aicore__ inline void SyncMte2ToV() {
@@ -524,6 +544,11 @@ public:
         TEventID id = pipe->FetchEventID(HardEvent::S_V);
         SetFlag<HardEvent::S_V>(id);
         WaitFlag<HardEvent::S_V>(id);
+    }
+    __aicore__ inline void SyncSToMte3() {
+        TEventID id = pipe->FetchEventID(HardEvent::S_MTE3);
+        SetFlag<HardEvent::S_MTE3>(id);
+        WaitFlag<HardEvent::S_MTE3>(id);
     }
     template<class U>
     __aicore__ inline void FastPad(LocalTensor<U> dst, GlobalTensor<U> src, uint64_t offset, uint32_t count) {
@@ -954,10 +979,8 @@ public:
         uint32_t mine = last - first;
         bool narrowAligned = (fNIP == fNI) && (fN1P == fN1);
         if (mine == 0) {
-            // The row budget is fixed, so a core without a row only has to
-            // publish its (zero) share of the merged gradient.
-            Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
-            PublishTiny(0.0f);
+            // A core without a row has nothing to contribute and the row owner
+            // folds only the producers, so it leaves without touching the workspace.
             return;
         }
         // A core's rows never straddle a batch here, so only that batch's key
@@ -977,6 +1000,12 @@ public:
         if (mine*fK) FastPad(idxT, indices, (uint64_t)first*fK, mine*fK);
         LocalTensor<int32_t> qlenT = base[fOffAux][1024].ReinterpretCast<int32_t>();
         LocalTensor<int32_t> klenT = base[fOffAux][1536].ReinterpretCast<int32_t>();
+        if (cores > 1) {
+            // the launch epoch rides along with the input transfers, so the handshake
+            // at the end of the row work never waits on a fresh transfer
+            LocalTensor<uint32_t> epochIn = base[fOffAux][kEpochLaneOffset].ReinterpretCast<uint32_t>();
+            FastPad(epochIn, epochWord, 0, 1);
+        }
         if (t.queryLengthType == 1) FastPad(qlenT, ql32, 0, t.batch);
         else if (t.queryLengthType == 2) FastPad(qlenT.ReinterpretCast<int64_t>(), ql64, 0, t.batch);
         if (t.keyLengthType == 1) FastPad(klenT, kl32, 0, t.batch);
@@ -987,8 +1016,10 @@ public:
             } else {
                 FastPad(a[fOffWStage].ReinterpretCast<W>(), w, (uint64_t)first*fNI, mine*fNI);
             }
-            FastPad(base[fOffMax], maxima, (uint64_t)first*fN1, mine*fN1);
-            FastPad(base[fOffSum], sums, (uint64_t)first*fN1, mine*fN1);
+            if (!t.fastRecompute) {
+                FastPad(base[fOffMax], maxima, (uint64_t)first*fN1, mine*fN1);
+                FastPad(base[fOffSum], sums, (uint64_t)first*fN1, mine*fN1);
+            }
         } else {
             for (uint32_t r = 0; r < mine; ++r) {
                 uint32_t tr = first + r;
@@ -997,8 +1028,10 @@ public:
                 } else {
                     FastPad(a[fOffWStage].ReinterpretCast<W>()[r*fWStageStride], w, (uint64_t)tr*fNI, fNI);
                 }
-                FastPad(base[fOffMax][r*fN1P], maxima, (uint64_t)tr*fN1, fN1);
-                FastPad(base[fOffSum][r*fN1P], sums, (uint64_t)tr*fN1, fN1);
+                if (!t.fastRecompute) {
+                    FastPad(base[fOffMax][r*fN1P], maxima, (uint64_t)tr*fN1, fN1);
+                    FastPad(base[fOffSum][r*fN1P], sums, (uint64_t)tr*fN1, fN1);
+                }
             }
         }
         SyncMte2ToV();
@@ -1177,28 +1210,58 @@ public:
         if (mine) StoreRowGradients(first, mine);
         PublishTiny(totalLoss);
     }
-    // Publish this core's share of the merged gradient and of the loss.
+    // Publish this core's share of the merged gradient and of the loss.  The
+    // vector-only launch carries no hardware barrier, so the producers rendezvous
+    // through the workspace: each one leaves its partial, its loss share and a
+    // ready stamp derived from the launch epoch in a single transfer, and the row
+    // owner folds the partials once every stamp of this launch has landed.
     __aicore__ inline void PublishTiny(float myLoss) {
         LocalTensor<float> base = a;
+        LocalTensor<uint32_t> auxWords = base[fOffAux][kEpochLaneOffset].ReinterpretCast<uint32_t>();
         uint32_t keys = static_cast<uint32_t>((uint64_t)t.batch*fS2);
         uint32_t cores = t.cores ? t.cores : 1u;
+        uint32_t span = keys*fDi;
         if (cores > 1) {
-            uint32_t span = keys*fDi;
+            uint32_t per = (fRows + cores - 1) / cores;
+            uint32_t active = per ? (fRows + per - 1) / per : 0u;
+            if (active > cores) active = cores;
             uint32_t slot = t.batchScratch ? t.batchScratch : span;
-            // The loss share rides in the spare lane of this core's own slot, so both
-            // leave through one transfer and no cached scalar store has to be
-            // published before the barrier.
+            // the epoch transfer was issued with the preamble, so it is long settled
+            PipeBarrier<PIPE_ALL>();
+            uint32_t epoch = auxWords.GetValue(kEpochLane);
+            base[fOffDk].ReinterpretCast<uint32_t>().SetValue(span + 1, SliStamp(epoch, GetBlockIdx()));
             Duplicate(base[fOffDk][span], myLoss, 1);
+            SyncSToMte3();
             SyncVToMte3();
-            DataCopyExtParams pw{1, static_cast<uint32_t>((span + 1)*sizeof(float)), 0, 0, 0};
+            DataCopyExtParams pw{1, static_cast<uint32_t>((span + 2)*sizeof(float)), 0, 0, 0};
             DataCopyPad(scratch, base[fOffDk], pw);
-            SyncAll();
             if (GetBlockIdx() == 0) {
-                LocalTensor<float> acc = MergePartials(base, cores, span, slot, 1u);
+                LocalTensor<uint32_t> stampIn = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
+                uint32_t expect[8];
+                for (uint32_t c = 0; c < active; ++c) expect[c] = SliStamp(epoch, c);
+                uint32_t settled = 0;
+                while (settled < active) {
+                    SyncVToMte2();
+                    DataCopyExtParams pr{static_cast<uint16_t>(active), sizeof(uint32_t),
+                                         static_cast<uint32_t>((slot - 1)*sizeof(float)), 0, 0};
+                    DataCopyPad(stampIn, stamps, pr, DataCopyPadExtParams<uint32_t>{false,0,0,0});
+                    PipeBarrier<PIPE_ALL>();
+                    settled = 0;
+                    for (uint32_t c = 0; c < active; ++c)
+                        if (stampIn.GetValue((uint64_t)c*kStampStride) == expect[c]) ++settled;
+                    PipeBarrier<PIPE_ALL>();
+                }
+                PipeBarrier<PIPE_ALL>();
+                LocalTensor<float> acc = MergePartials(base, active, span, slot, 1u);
                 FastStore(dk, 0, acc, span);
                 SyncVToS();
                 loss.SetValue(0, acc[span].GetValue(0));
                 DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
+                // the next launch reads this before any core stamps again
+                auxWords.SetValue(kEpochLane, epoch + 1u);
+                SyncSToMte3();
+                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(epochWord, auxWords, pe);
             }
         } else {
             FastStore(dk, 0, base[fOffDk], keys*fDi);
@@ -1346,7 +1409,7 @@ __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     GM_ADDR dWeight, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling) {
     // the row-split fast path synchronizes cores with the hardware barrier, which
     // needs the MIX AIV:AIC 1:0 launch type (it still starts vector cores only)
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(SparseLightningIndexerGradKlLossTilingData);
     GET_TILING_DATA_WITH_STRUCT(SparseLightningIndexerGradKlLossTilingData,t,tiling);
     SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE> op;
