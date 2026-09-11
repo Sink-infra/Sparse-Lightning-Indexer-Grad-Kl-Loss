@@ -766,6 +766,31 @@ public:
                 Mul(prod, sim, wRow, fNI, m, BinaryRepeatParams(1, 1, 1, fNIP/8, fNIP/8, 0));
                 WholeReduceSum(logit, prod, fNI, m, 1, 1, fNIP/8);
                 // ---- softmax over the selected keys and KL ----
+                // Reducing to the scalar unit costs a full pipeline drain, so with a
+                // handful of keys every summary is broadcast inside the vector unit.
+                if (m <= 8) {
+                    WholeReduceSum(work, mass, m, 1, 1, 1, 1);
+                    WholeReduceMax(work[64], logit, m, 1, 1, 1, 1, ReduceOrder::ORDER_ONLY_VALUE);
+                    Brcb(work[192], work, 1, BrcbRepeatParams(1, 8));
+                    Brcb(work[256], work[64], 1, BrcbRepeatParams(1, 8));
+                    Div(work[128], mass, work[192], m);
+                    Sub(work[192], logit, work[256], m);
+                    Exp(work[192], work[192], m);
+                    WholeReduceSum(work[64], work[192], m, 1, 1, 1, 1);
+                    Ln(work[64], work[64], 1);
+                    Add(work[64], work[64], work[256], 1);
+                    Brcb(work[320], work[64], 1, BrcbRepeatParams(1, 8));
+                    Maxs(work[192], work[128], 1e-30f, m);
+                    Ln(work[192], work[192], m);
+                    Sub(work[192], work[192], logit, m);
+                    Add(work[192], work[192], work[320], m);
+                    Mul(work[192], work[192], work[128], m);
+                    WholeReduceSum(work[64], work[192], m, 1, 1, 1, 1);
+                    Add(lossAcc, lossAcc, work[64], 1);
+                    Sub(work[192], logit, work[320], m);
+                    Exp(work[192], work[192], m);
+                    Sub(di, work[192], work[128], m);
+                } else {
                 WholeReduceSum(work, mass, m, 1, 1, 1, 1);
                 float invM = 1.0f / work.GetValue(0);
                 WholeReduceMax(work[128], logit, m, 1, 1, 1, 1, ReduceOrder::ORDER_ONLY_VALUE);
@@ -785,6 +810,7 @@ public:
                 Adds(logit, logit, -logL, m);
                 Exp(logit, logit, m);
                 Sub(di, logit, work[128], m);
+                }
                 // per-key constants must vary along the repeat axis, so build a
                 // row-constant matrix (row j = di[j]) before the reductions
                 for (uint32_t p = 0; p < fNIP / 8; ++p)
