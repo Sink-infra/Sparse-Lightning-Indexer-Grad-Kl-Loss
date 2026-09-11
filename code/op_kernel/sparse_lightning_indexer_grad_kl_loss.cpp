@@ -126,6 +126,7 @@ class SparseGrad {
     uint64_t fOffQ, fOffQR, fOffQI, fOffW, fOffMax, fOffSum, fOffC;
     uint64_t fOffKey, fOffKeyR, fOffKi, fOffSim, fOffSelK, fOffSelKR, fOffSelKI;
     uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx, fOffRed;
+    uint64_t fOffDkProd, fOffDsSpr, fOffDiSpr;
     GlobalTensor<float> wsAll;
     uint64_t fOffSco, fOffPos, fOffDiMat, fOffV, fOffU, fOffUmat, fOffDqAcc, fOffWStage;
     uint32_t fWStageStride;
@@ -189,6 +190,15 @@ class SparseGrad {
         fOffProd = FastTake(o, prodNeed);
         fOffAux = FastTake(o, 2048);
         fOffIdx = FastTake(o, rows*k);
+        // tiny path scratch: per-key indexer products and the block-spread copies
+        // that let one iteration carry a whole vector of per-key constants
+        if (t.tiny) {
+            fOffDkProd = FastTake(o, kp*nip*di);
+            fOffDsSpr = FastTake(o, 8*kp*nip);
+            fOffDiSpr = FastTake(o, 8*kp);
+        } else {
+            fOffDkProd = 0; fOffDsSpr = 0; fOffDiSpr = 0;
+        }
         // One staging slice per input tensor lets every transfer be issued before a
         // single wait; slices only need 32B alignment.
         // One staging slice per non-float32 input tensor lets every transfer be
@@ -453,6 +463,16 @@ public:
         TEventID id = pipe.FetchEventID(HardEvent::MTE3_V);
         SetFlag<HardEvent::MTE3_V>(id);
         WaitFlag<HardEvent::MTE3_V>(id);
+    }
+    __aicore__ inline void SyncVToS() {
+        TEventID id = pipe.FetchEventID(HardEvent::V_S);
+        SetFlag<HardEvent::V_S>(id);
+        WaitFlag<HardEvent::V_S>(id);
+    }
+    __aicore__ inline void SyncSToV() {
+        TEventID id = pipe.FetchEventID(HardEvent::S_V);
+        SetFlag<HardEvent::S_V>(id);
+        WaitFlag<HardEvent::S_V>(id);
     }
     template<class U>
     __aicore__ inline void FastPad(LocalTensor<U> dst, GlobalTensor<U> src, uint64_t offset, uint32_t count) {
@@ -891,8 +911,298 @@ public:
             DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
         }
     }
+    // ---- tiny path: one row per core, one contraction per selected key ----
+    // Every dot is a broadcast multiply plus a single repeat reduce, and the
+    // per-key constants shared by the gradient terms come out of one block
+    // spread copy instead of one broadcast per key and head.
+    __aicore__ inline void ProcessTiny() {
+        LocalTensor<float> base = a;
+        LocalTensor<int32_t> idxT = base[fOffIdx].ReinterpretCast<int32_t>();
+        uint32_t keys = static_cast<uint32_t>((uint64_t)t.batch*fS2);
+        uint32_t cores = t.cores ? t.cores : 1u;
+        uint32_t per = (fRows + cores - 1) / cores;
+        uint32_t first = GetBlockIdx() * per;
+        uint32_t last = first + per;
+        if (last > fRows) last = fRows;
+        if (first > fRows) first = fRows;
+        uint32_t mine = last - first;
+        bool narrowAligned = (fNIP == fNI) && (fN1P == fN1);
+        // every transfer is issued before a single pipeline wait
+        FastDma(base[fOffQ], q, (uint64_t)first*fN1*fDq, mine*fN1*fDq, fStgQ);
+        FastDma(base[fOffQR], qr, (uint64_t)first*fN1*fDr, mine*fN1*fDr, fStgQR);
+        FastDma(base[fOffQI], qi, (uint64_t)first*fNI*fDi, mine*fNI*fDi, fStgQI);
+        FastDma(base[fOffKey], k, 0, keys*fDq, fStgKey);
+        FastDma(base[fOffKeyR], kr, 0, keys*fDr, fStgKeyR);
+        FastDma(base[fOffKi], ki, 0, keys*fDi, fStgKi);
+        if (mine*fK) FastPad(idxT, indices, (uint64_t)first*fK, mine*fK);
+        if (narrowAligned) {
+            if constexpr (AscendC::IsSameType<W,float>::value) {
+                FastPad(base[fOffW], w, (uint64_t)first*fNI, mine*fNI);
+            } else {
+                FastPad(a[fOffWStage].ReinterpretCast<W>(), w, (uint64_t)first*fNI, mine*fNI);
+            }
+            FastPad(base[fOffMax], maxima, (uint64_t)first*fN1, mine*fN1);
+            FastPad(base[fOffSum], sums, (uint64_t)first*fN1, mine*fN1);
+        } else {
+            for (uint32_t r = 0; r < mine; ++r) {
+                uint32_t tr = first + r;
+                if constexpr (AscendC::IsSameType<W,float>::value) {
+                    FastPad(base[fOffW][r*fNIP], w, (uint64_t)tr*fNI, fNI);
+                } else {
+                    FastPad(a[fOffWStage].ReinterpretCast<W>()[r*fWStageStride], w, (uint64_t)tr*fNI, fNI);
+                }
+                FastPad(base[fOffMax][r*fN1P], maxima, (uint64_t)tr*fN1, fN1);
+                FastPad(base[fOffSum][r*fN1P], sums, (uint64_t)tr*fN1, fN1);
+            }
+        }
+        SyncMte2ToV();
+        FastCast<T>(base[fOffQ], fStgQ, mine*fN1*fDq);
+        FastCast<QR>(base[fOffQR], fStgQR, mine*fN1*fDr);
+        FastCast<T>(base[fOffQI], fStgQI, mine*fNI*fDi);
+        if constexpr (!AscendC::IsSameType<W,float>::value) {
+            if (narrowAligned) {
+                Cast(base[fOffW], a[fOffWStage].ReinterpretCast<W>(), RoundMode::CAST_NONE,
+                     static_cast<int32_t>(mine*fNI));
+            } else {
+                for (uint32_t r = 0; r < mine; ++r)
+                    Cast(base[fOffW][r*fNIP], a[fOffWStage].ReinterpretCast<W>()[r*fWStageStride],
+                         RoundMode::CAST_NONE, static_cast<int32_t>(fNI));
+            }
+        }
+        FastCast<T>(base[fOffKey], fStgKey, keys*fDq);
+        FastCast<KR>(base[fOffKeyR], fStgKeyR, keys*fDr);
+        FastCast<T>(base[fOffKi], fStgKi, keys*fDi);
+        Muls(base[fOffQ], base[fOffQ], t.scale, mine*fN1*fDq);
+        Muls(base[fOffQR], base[fOffQR], t.scale, mine*fN1*fDr);
+        Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
+        if (mine) { Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi); Duplicate(base[fOffDw], 0.0f, fRows*fNI); }
+        if (!t.fastRecompute) {
+            Duplicate(base[fOffC], 0.0f, fRows*fN1P);
+            Ln(base[fOffC], base[fOffSum], fRows*fN1P);
+            Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
+        } else {
+            Duplicate(base[fOffC], 0.0f, fRows*fN1P);
+        }
+        LocalTensor<float> lossVec = base[fOffAux][512];
+        LocalTensor<float> dIvec = base[fOffAux][128];
+        LocalTensor<float> massV = base[fOffAux][256];
+        LocalTensor<float> logitV = base[fOffAux][256 + fKP];
+        LocalTensor<float> dkprod = base[fOffDkProd];
+        LocalTensor<float> dsspr = base[fOffDsSpr];
+        LocalTensor<float> dispr = base[fOffDiSpr];
+        LocalTensor<float> prod = base[fOffProd];
+        LocalTensor<float> prod2 = base[fOffProd][fN1P*fDq + 64];
+        LocalTensor<float> sco = base[fOffSco];
+        LocalTensor<float> sim = base[fOffSim];
+        LocalTensor<float> ind = base[fOffPos];
+        LocalTensor<float> ds = base[fOffDiMat];
+        LocalTensor<float> dqRow = base[fOffDq];
+        uint32_t sel[8];
+        float totalLoss = 0.0f;
+        bool useProvided = true;
+        if (t.fastRecompute) {
+            useProvided = false;
+            uint32_t b0 = first / t.queryRows;
+            uint32_t r0 = first - b0*t.queryRows;
+            uint32_t qlen0 = t.empty ? 0 : Length(true, b0);
+            uint32_t klen0 = Length(false, b0);
+            int32_t vis0 = static_cast<int32_t>(r0) + static_cast<int32_t>(klen0)
+                           - static_cast<int32_t>(qlen0) + 1;
+            if (qlen0 > 0 && vis0 > 0) {
+                useProvided = true;
+                uint32_t hh[2];
+                float gMax[2], gSum[2], red[2];
+                hh[0] = 0;
+                hh[1] = fN1 > 1 ? fN1 - 1 : 0;
+                for (uint32_t t2 = 0; t2 < 2; ++t2) {
+                    gMax[t2] = base[fOffMax].GetValue(hh[t2]);
+                    gSum[t2] = base[fOffSum].GetValue(hh[t2]);
+                }
+                for (uint32_t t2 = 0; t2 < 2; ++t2) {
+                    uint32_t h = hh[t2];
+                    Mul(prod, base[fOffKey], base[fOffQ][h*fDq], fDq, vis0,
+                        BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
+                    WholeReduceSum(lossVec, prod, fDq, vis0, 1, 1, fDq/8);
+                    Mul(prod, base[fOffKeyR], base[fOffQR][h*fDr], fDr, vis0,
+                        BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
+                    WholeReduceSum(lossVec[64], prod, fDr, vis0, 1, 1, fDr/8);
+                    Add(lossVec, lossVec, lossVec[64], vis0);
+                    Adds(lossVec, lossVec, -gMax[t2], vis0);
+                    Exp(lossVec, lossVec, vis0);
+                    WholeReduceSum(lossVec[128 + t2*64], lossVec, vis0, 1, 1, 1, 1);
+                }
+                for (uint32_t t2 = 0; t2 < 2; ++t2)
+                    red[t2] = lossVec[128 + t2*64].GetValue(0);
+                for (uint32_t t2 = 0; t2 < 2 && useProvided; ++t2) {
+                    float diff = red[t2] - gSum[t2];
+                    if (diff < 0) diff = -diff;
+                    float bound = 1e-2f * (gSum[t2] > 0 ? gSum[t2] : -gSum[t2]);
+                    useProvided = diff <= (bound > 1e-3f ? bound : 1e-3f);
+                }
+            }
+            if (useProvided) {
+                Ln(base[fOffC], base[fOffSum], fRows*fN1P);
+                Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
+            }
+        }
+        for (uint32_t b = 0; b < t.batch; ++b) {
+            uint32_t qlen = t.empty ? 0 : Length(true, b);
+            uint32_t klen = Length(false, b);
+            for (uint32_t row = 0; row < t.queryRows; ++row) {
+                uint64_t token = (uint64_t)b*t.queryRows + row;
+                if (token < first || token >= last) continue;
+                if (row >= qlen) continue;
+                uint32_t local = (uint32_t)(token - first);
+                int32_t visible = static_cast<int32_t>(row) + static_cast<int32_t>(klen)
+                                  - static_cast<int32_t>(qlen) + 1;
+                uint32_t m = 0;
+                for (uint32_t j = 0; j < fK; ++j) {
+                    int32_t key = idxT.GetValue((uint64_t)local*fK + j);
+                    if (key >= 0 && key < static_cast<int32_t>(klen) && key < visible) sel[m++] = (uint32_t)key;
+                }
+                if (m == 0) continue;
+                LocalTensor<float> qRow = base[fOffQ][(uint64_t)local*fN1*fDq];
+                LocalTensor<float> qrRow = base[fOffQR][(uint64_t)local*fN1*fDr];
+                LocalTensor<float> qiRow = base[fOffQI][(uint64_t)local*fNI*fDi];
+                LocalTensor<float> dwRow = base[fOffDw][(uint64_t)local*fNI];
+                LocalTensor<float> wRow = base[fOffW][(uint64_t)local*fNIP];
+                LocalTensor<float> cRow = base[fOffC][(uint64_t)local*fN1P];
+                LocalTensor<float> dqOut = dqRow[(uint64_t)local*fNI*fDi];
+                if (!useProvided && visible > 0) {
+                    LocalTensor<float> keyB = base[fOffKey][(uint64_t)b*fS2*fDq];
+                    LocalTensor<float> keyRB = base[fOffKeyR][(uint64_t)b*fS2*fDr];
+                    for (uint32_t h = 0; h < fN1; ++h) {
+                        Mul(prod, keyB, qRow[h*fDq], fDq, visible,
+                            BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
+                        WholeReduceSum(lossVec, prod, fDq, visible, 1, 1, fDq/8);
+                        Mul(prod, keyRB, qrRow[h*fDr], fDr, visible,
+                            BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
+                        WholeReduceSum(lossVec[64], prod, fDr, visible, 1, 1, fDr/8);
+                        Add(lossVec, lossVec, lossVec[64], visible);
+                        WholeReduceMax(lossVec[128], lossVec, visible, 1, 1, 1, 1,
+                                       ReduceOrder::ORDER_ONLY_VALUE);
+                        float mx = lossVec[128].GetValue(0);
+                        Adds(lossVec, lossVec, -mx, visible);
+                        Exp(lossVec, lossVec, visible);
+                        WholeReduceSum(lossVec[64], lossVec, visible, 1, 1, 1, 1);
+                        cRow.SetValue(h, mx + SliLog(lossVec[64].GetValue(0)));
+                    }
+                }
+                // ---- main scores and indexer similarities at the selected keys ----
+                for (uint32_t j = 0; j < m; ++j) {
+                    uint64_t kb = (uint64_t)b*fS2 + sel[j];
+                    Mul(prod, qRow, base[fOffKey][kb*fDq], fDq, (uint8_t)fN1,
+                        BinaryRepeatParams(1, 1, 1, fDq/8, fDq/8, 0));
+                    MulAddDst(prod, qrRow, base[fOffKeyR][kb*fDr], fDr, (uint8_t)fN1,
+                              BinaryRepeatParams(1, 1, 1, fDq/8, fDr/8, 0));
+                    WholeReduceSum(sco[j*fN1P], prod, fDq, (uint8_t)fN1, 1, 1, fDq/8);
+                    Mul(prod, qiRow, base[fOffKi][kb*fDi], fDi, (uint8_t)fNI,
+                        BinaryRepeatParams(1, 1, 1, fDi/8, fDi/8, 0));
+                    WholeReduceSum(sim[j*fNIP], prod, fDi, (uint8_t)fNI, 1, 1, fDi/8);
+                }
+                uint32_t mMask = m*fNIP;
+                Maxs(sim, sim, 0.0f, mMask);
+                Muls(ind, sim, 1e30f, mMask);
+                Mins(ind, ind, 1.0f, mMask);
+                // ---- selected softmax and KL ----
+                Mul(prod2, sim, wRow, fNI, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fNIP/8, fNIP/8, 0));
+                WholeReduceSum(logitV, prod2, fNI, (uint8_t)m, 1, 1, fNIP/8);
+                Sub(prod2, sco, cRow, fN1, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fN1P/8, fN1P/8, 0));
+                Exp(prod2, prod2, fN1, (uint8_t)m, UnaryRepeatParams(1, 1, fN1P/8, fN1P/8));
+                WholeReduceSum(massV, prod2, fN1, (uint8_t)m, 1, 1, fN1P/8);
+                SyncVToS();
+                float mass[8], logit[8], di[8];
+                float msum = 0.0f, lmax = -3.4e38f;
+                for (uint32_t j = 0; j < m; ++j) {
+                    mass[j] = massV.GetValue(j);
+                    msum += mass[j];
+                    logit[j] = logitV.GetValue(j);
+                    if (logit[j] > lmax) lmax = logit[j];
+                }
+                if (!(msum > 0.0f)) msum = 1.0f;
+                float lsum = 0.0f;
+                for (uint32_t j = 0; j < m; ++j) lsum += SliExp(logit[j] - lmax);
+                float logl = lmax + SliLog(lsum);
+                for (uint32_t j = 0; j < m; ++j) {
+                    float p = mass[j]/msum;
+                    float q = SliExp(logit[j] - logl);
+                    di[j] = q - p;
+                    if (p > 0.0f) totalLoss += p*(SliLog(p) - (logit[j] - logl));
+                }
+                for (uint32_t j = 0; j < m; ++j) dIvec.SetValue(j, di[j]);
+                SyncSToV();
+                // ---- gradients ----
+                // dWeights uses the rectified similarities themselves, the two
+                // scatter terms only their sign, so the shared product carries the
+                // indicator and the weights while dWeights keeps the plain product.
+                Brcb(dispr, dIvec, 1, BrcbRepeatParams(1, 8));
+                Mul(ds, ind, dispr, fNI, (uint8_t)m,
+                    BinaryRepeatParams(1, 1, 0, fNIP/8, fNIP/8, 1));
+                Mul(ds, ds, wRow, fNI, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fNIP/8, fNIP/8, 0));
+                Brcb(dsspr, ds, (uint8_t)((m*fNIP)/8), BrcbRepeatParams(1, 8));
+                for (uint32_t j = 0; j < m; ++j) {
+                    uint64_t kb = (uint64_t)b*fS2 + sel[j];
+                    MulAddDst(dwRow, sim[j*fNIP], dispr[j*8], fNI, 1,
+                              BinaryRepeatParams(1, 1, 0, 1, 1, 1));
+                    MulAddDst(dqOut, base[fOffKi][kb*fDi], dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
+                              BinaryRepeatParams(1, 1, 0, fDi/8, 0, 1));
+                    Mul(dkprod[(uint64_t)j*fNI*fDi], qiRow, dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
+                        BinaryRepeatParams(1, 1, 0, fDi/8, fDi/8, 1));
+                }
+                uint32_t left = fNI;
+                while (left > 1) {
+                    uint32_t half = left / 2;
+                    Add(dkprod, dkprod, dkprod[fDi], fDi, (uint8_t)(m*half),
+                        BinaryRepeatParams(1, 1, 1, fDi/8, 2*fDi/8, 2*fDi/8));
+                    left = half;
+                }
+                for (uint32_t j = 0; j < m; ++j) {
+                    LocalTensor<float> dkRow = base[fOffDk][((uint64_t)b*fS2 + sel[j])*fDi];
+                    Add(dkRow, dkRow, dkprod[(uint64_t)j*fDi], fDi);
+                }
+            }
+        }
+        if (mine) {
+            FastStore(dq, (uint64_t)first*fNI*fDi, base[fOffDq], mine*fNI*fDi);
+            FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
+        }
+        float myLoss = totalLoss;
+        if (cores > 1) {
+            DataCopyExtParams pw{1, static_cast<uint32_t>(keys*fDi*sizeof(float)), 0, 0, 0};
+            SyncVToMte3();
+            DataCopyPad(scratch, base[fOffDk], pw);
+            PipeBarrier<PIPE_ALL>();
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(scratch);
+            losses.SetValue(GetBlockIdx()*16, myLoss);
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(losses);
+            SyncAll();
+            if (GetBlockIdx() == 0) {
+                DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(wsAll);
+                PipeBarrier<PIPE_ALL>();
+                LocalTensor<float> acc = base[fOffRed];
+                DataCopyExtParams pr{1, static_cast<uint32_t>(cores*keys*fDi*sizeof(float)), 0, 0, 0};
+                DataCopyPad(acc, wsAll[0], pr, DataCopyPadExtParams<float>{false,0,0,0});
+                SyncMte2ToV();
+                uint32_t span = keys*fDi;
+                for (uint32_t c = 1; c < cores; ++c) Add(acc, acc, acc[(uint64_t)c*span], span);
+                FastStore(dk, 0, acc, keys*fDi);
+                float total = 0;
+                for (uint32_t c = 0; c < cores; ++c) total += losses.GetValue(c*16);
+                loss.SetValue(0, total);
+                DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
+            }
+        } else {
+            FastStore(dk, 0, base[fOffDk], keys*fDi);
+            loss.SetValue(0, myLoss);
+            DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
+        }
+    }
     __aicore__ inline void Process() {
-        if (t.fast) { ProcessFast(); return; }
+        if (t.fast) {
+            if (t.tiny) { ProcessTiny(); return; }
+            ProcessFast();
+            return;
+        }
         if constexpr (AscendC::IsSameType<T,float>::value) { ProcessAccurate(); return; }
         float totalLoss = 0, lossCorrection = 0;
         for (uint32_t batch = GetBlockIdx(); batch < t.batch; batch += t.cores) {
