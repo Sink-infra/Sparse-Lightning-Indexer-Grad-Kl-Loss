@@ -999,7 +999,7 @@ public:
         LocalTensor<float> dIvec = base[fOffAux][128];
         LocalTensor<float> massV = base[fOffAux][256];
         LocalTensor<float> logitV = base[fOffAux][256 + fKP];
-        LocalTensor<float> dkprod = base[fOffDkProd];
+        LocalTensor<float> dkAcc = base[fOffDkProd];
         LocalTensor<float> dsspr = base[fOffDsSpr];
         LocalTensor<float> dispr = base[fOffDiSpr];
         LocalTensor<float> prod = base[fOffProd];
@@ -1162,26 +1162,22 @@ public:
                 Mul(ds, ind, dispr, fNI, (uint8_t)m,
                     BinaryRepeatParams(1, 1, 0, fNIP/8, fNIP/8, 1));
                 Mul(ds, ds, wRow, fNI, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fNIP/8, fNIP/8, 0));
+                // dWeights contracts over the keys and dKeyIndex over the heads, so
+                // each keeps one live accumulator and folds every term into it.
+                MulAddDst(dwRow, sim, dispr, fNI, (uint8_t)m,
+                          BinaryRepeatParams(1, 1, 0, 0, fNIP/8, 1));
                 Brcb(dsspr, ds, (uint8_t)((m*fNIP)/8), BrcbRepeatParams(1, 8));
+                Duplicate(dkAcc, 0.0f, m*fDi);
                 for (uint32_t j = 0; j < m; ++j) {
                     uint64_t kb = (uint64_t)kbase + sel[j];
-                    MulAddDst(dwRow, sim[j*fNIP], dispr[j*8], fNI, 1,
-                              BinaryRepeatParams(1, 1, 0, 1, 1, 1));
                     MulAddDst(dqOut, base[fOffKi][kb*fDi], dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
                               BinaryRepeatParams(1, 1, 0, fDi/8, 0, 1));
-                    Mul(dkprod[(uint64_t)j*fNI*fDi], qiRow, dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
-                        BinaryRepeatParams(1, 1, 0, fDi/8, fDi/8, 1));
-                }
-                uint32_t left = fNI;
-                while (left > 1) {
-                    uint32_t half = left / 2;
-                    Add(dkprod, dkprod, dkprod[fDi], fDi, (uint8_t)(m*half),
-                        BinaryRepeatParams(1, 1, 1, fDi/8, 2*fDi/8, 2*fDi/8));
-                    left = half;
+                    MulAddDst(dkAcc[(uint64_t)j*fDi], qiRow, dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
+                              BinaryRepeatParams(1, 1, 0, 0, fDi/8, 1));
                 }
                 for (uint32_t j = 0; j < m; ++j) {
                     LocalTensor<float> dkRow = base[fOffDk][((uint64_t)b*fS2 + sel[j])*fDi];
-                    Add(dkRow, dkRow, dkprod[(uint64_t)j*fDi], fDi);
+                    Add(dkRow, dkRow, dkAcc[(uint64_t)j*fDi], fDi);
                 }
             }
         }
