@@ -151,6 +151,7 @@ class SparseGrad {
     uint64_t fOffQ, fOffQR, fOffQI, fOffW, fOffMax, fOffSum, fOffC;
     uint64_t fOffKey, fOffKeyR, fOffKi, fOffSim, fOffSelK, fOffSelKR, fOffSelKI;
     uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx, fOffRed;
+    uint64_t fProdNeed;
     uint64_t fOffDkProd, fOffDsSpr, fOffDiSpr, fOffHeadScr;
     GlobalTensor<float> wsAll;
     GlobalTensor<uint32_t> stampArr;
@@ -223,6 +224,7 @@ class SparseGrad {
         uint64_t split = n1p*dq + 64 + nip*di;               // per-key products + head tree
         if (split > prodNeed) prodNeed = split;
         if (kp*nip > prodNeed) prodNeed = kp*nip;
+        fProdNeed = prodNeed;
         fOffProd = FastTake(o, prodNeed);
         fOffAux = FastTake(o, 2048);
         fOffIdx = FastTake(o, rows*k);
@@ -1153,6 +1155,13 @@ public:
                     uint32_t vis = static_cast<uint32_t>(visible);
                     uint32_t s2p = (fS2 + 7) / 8 * 8;
                     uint32_t hstride = s2p / 8;
+                    // BlockReduceSum folds each 32B block, so a 64-lane dot product
+                    // needs two cheap passes instead of one full-width tree per key.
+                    // The second pass consumes eight keys per iteration, so its scratch
+                    // has to hold one 8-value group per key.
+                    LocalTensor<float> blockSums = base[fOffProd][(uint64_t)fN1P*fDq + 64];
+                    bool twoLevel = fDq == 64 &&
+                        (uint64_t)s2p*8 + 64 + (uint64_t)fN1P*fDq <= fProdNeed;
                     for (uint32_t h = 0; h < fN1; ++h) {
                         // the rope block folds straight into the first lanes of the
                         // head rows, so one primitive and one reduce score a head
@@ -1160,7 +1169,12 @@ public:
                             BinaryRepeatParams(1, 1, 1, fDq/8, fDq/8, 0));
                         MulAddDst(prod, keyRB, qrRow[h*fDr], fDr, vis,
                                   BinaryRepeatParams(1, 1, 1, fDq/8, fDr/8, 0));
-                        WholeReduceSum(hSc[h*s2p], prod, fDq, vis, 1, 1, fDq/8);
+                        if (twoLevel) {
+                            BlockReduceSum(blockSums, prod, vis, fDq, 1, 1, fDq/8);
+                            BlockReduceSum(hSc[h*s2p], blockSums, (vis + 7) / 8, fDq, 1, 1, 8);
+                        } else {
+                            WholeReduceSum(hSc[h*s2p], prod, fDq, vis, 1, 1, fDq/8);
+                        }
                     }
                     Muls(hSc, hSc, t.scale, vis, (uint8_t)fN1, UnaryRepeatParams(1, 1, hstride, hstride));
                     WholeReduceMax(lossVec[128], hSc, vis, (uint8_t)fN1, 1, 1, hstride,
