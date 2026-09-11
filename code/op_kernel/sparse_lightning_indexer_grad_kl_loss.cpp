@@ -51,8 +51,14 @@ __aicore__ inline uint32_t SliStamp(uint32_t epoch, uint32_t core) {
 constexpr uint32_t kEpochLane = 0u;
 // each 4-byte stamp occupies its own 32B block in the polling buffer
 constexpr uint32_t kStampStride = 8u;
-// spare lanes of the per-core auxiliary block: the epoch word and the poll buffer
+// the cleared-output stamp sits behind the launch epoch in the sync span
+constexpr uint32_t kClearLane = 8u;
+// the cleared-output stamp lives in its own namespace
+constexpr uint32_t kClearStamp = 0x2000u;
+// spare lanes of the per-core auxiliary block: the epoch word, the poll buffer and
+// the loss share staged for the FP32 atomic fold
 constexpr uint32_t kEpochLaneOffset = 832u;
+constexpr uint32_t kLossLane = 960u;
 constexpr uint32_t kStampLaneOffset = 896u;
 
 // A two-float expansion retains probability residuals through cancellation.
@@ -149,6 +155,8 @@ class SparseGrad {
     GlobalTensor<float> wsAll;
     GlobalTensor<uint32_t> stamps;
     GlobalTensor<uint32_t> epochWord;
+    GlobalTensor<uint32_t> clearWord;
+    uint32_t launchEpoch;
     uint64_t fOffSco, fOffPos, fOffDiMat, fOffV, fOffU, fOffUmat, fOffDqAcc, fOffWStage;
     uint32_t fWStageStride;
     uint32_t fN1P, fNIP;
@@ -335,6 +343,7 @@ public:
         losses.SetGlobalBuffer((__gm__ float*)workspace + t.cores*t.batchScratch);
         uint64_t syncBase = (uint64_t)t.cores*t.batchScratch + (uint64_t)t.cores*16;
         epochWord.SetGlobalBuffer((__gm__ uint32_t*)workspace + syncBase);
+        clearWord.SetGlobalBuffer((__gm__ uint32_t*)workspace + syncBase + kClearLane);
         stamps.SetGlobalBuffer((__gm__ uint32_t*)workspace +
             (uint64_t)t.batch*t.keyRows*t.indexDim + 1);
         stride = (t.indexDim + 7)/8*8;
@@ -1064,6 +1073,22 @@ public:
             Ln(base[fOffC], base[fOffSum], fRows*fN1P);
             Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
         }
+        if (cores > 1 && AscendC::IsSameType<T,float>::value) {
+            // The FP32 gradients fold straight into the outputs, so the row owner
+            // clears them and publishes that clear before anyone adds to them.
+            PipeBarrier<PIPE_ALL>();
+            launchEpoch = base[fOffAux][kEpochLaneOffset].ReinterpretCast<uint32_t>().GetValue(0);
+            if (GetBlockIdx() == 0) {
+                FastStore(dk, 0, base[fOffDk], static_cast<uint32_t>((uint64_t)t.batch*fS2*fDi));
+                loss.SetValue(0, 0.0f);
+                DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(loss);
+                LocalTensor<uint32_t> clearOut = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
+                clearOut.SetValue(0, SliStamp(launchEpoch, kClearStamp));
+                SyncSToMte3();
+                DataCopyExtParams pc{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(clearWord, clearOut, pc);
+            }
+        }
         LocalTensor<float> lossVec = base[fOffAux][512];
         LocalTensor<float> dIvec = base[fOffAux][128];
         LocalTensor<float> massV = base[fOffAux][256];
@@ -1221,7 +1246,35 @@ public:
         uint32_t keys = static_cast<uint32_t>((uint64_t)t.batch*fS2);
         uint32_t cores = t.cores ? t.cores : 1u;
         uint32_t span = keys*fDi;
-        if (cores > 1) {
+        if (cores > 1 && AscendC::IsSameType<T,float>::value) {
+            // the row owner has cleared the accumulators; fold this core's share in
+            LocalTensor<uint32_t> clearIn = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
+            uint32_t want = SliStamp(launchEpoch, kClearStamp);
+            uint32_t settled = 0;
+            while (!settled) {
+                SyncVToMte2();
+                DataCopyExtParams pr{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(clearIn, clearWord, pr, DataCopyPadExtParams<uint32_t>{false,0,0,0});
+                PipeBarrier<PIPE_ALL>();
+                settled = clearIn.GetValue(0) == want;
+                PipeBarrier<PIPE_ALL>();
+            }
+            base[fOffAux][kLossLane].SetValue(0, myLoss);
+            PipeBarrier<PIPE_ALL>();
+            SetAtomicAdd<float>();
+            FastStore(dk, 0, base[fOffDk], span);
+            DataCopyExtParams pl{1, sizeof(float), 0, 0, 0};
+            DataCopyPad(loss[0], base[fOffAux][kLossLane], pl);
+            SetAtomicNone();
+            if (GetBlockIdx() == 0) {
+                // the next launch reads this before any core relies on the clear
+                LocalTensor<uint32_t> epochOut = base[fOffAux][kEpochLaneOffset].ReinterpretCast<uint32_t>();
+                epochOut.SetValue(0, launchEpoch + 1u);
+                SyncSToMte3();
+                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(epochWord, epochOut, pe);
+            }
+        } else if (cores > 1) {
             uint32_t per = (fRows + cores - 1) / cores;
             uint32_t active = per ? (fRows + per - 1) / per : 0u;
             if (active > cores) active = cores;
