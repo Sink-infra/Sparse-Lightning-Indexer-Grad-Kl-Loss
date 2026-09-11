@@ -1315,31 +1315,26 @@ public:
             // trust the slot: the segments of a single burst are not guaranteed to land
             // in order, but queued transfers are issued in order.
             Duplicate(base[fOffDk][span], myLoss, 1);
-            SyncVToMte3();
-            DataCopyExtParams pw{1, static_cast<uint32_t>((span + 1)*sizeof(float)), 0, 0, 0};
-            DataCopyPad(scratch, base[fOffDk], pw);
-            LocalTensor<uint32_t> stampOut = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
-            stampOut.SetValue(0, SliStamp(epoch, GetBlockIdx()));
-            SyncSToMte3();
-            DataCopyExtParams pz{1, sizeof(uint32_t), 0, 0, 0};
-            DataCopyPad(stampArr[GetBlockIdx()], stampOut, pz);
+            // The row owner keeps its own share in place: it is already accumulating
+            // this row's gradients in its own slice, so only the other cores publish a
+            // partial and a ready word and the owner folds those into its slice.
             if (GetBlockIdx() == 0) {
                 // The ready words are compact, so polling costs a single 32B-class read
-                // no matter how wide a partial is; the slot span is then read once,
-                // after every stamp of this launch has been seen.
+                // no matter how wide a partial is; the published slots are then read
+                // once, after every stamp of this launch has been seen.
                 LocalTensor<float> buf = base[fOffRed][span + 8];
                 LocalTensor<uint32_t> stampIn = buf.ReinterpretCast<uint32_t>();
                 uint32_t expect[8];
-                for (uint32_t c = 0; c < active; ++c) expect[c] = SliStamp(epoch, c);
-                uint32_t settled = 0;
+                for (uint32_t c = 1; c < active; ++c) expect[c] = SliStamp(epoch, c);
+                uint32_t settled = 1;
                 while (settled < active) {
                     SyncVToMte2();
-                    DataCopyExtParams pr{1, static_cast<uint32_t>(active*sizeof(uint32_t)), 0, 0, 0};
-                    DataCopyPad(stampIn, stampArr, pr, DataCopyPadExtParams<uint32_t>{false,0,0,0});
+                    DataCopyExtParams pr{1, static_cast<uint32_t>((active - 1)*sizeof(uint32_t)), 0, 0, 0};
+                    DataCopyPad(stampIn, stampArr[1], pr, DataCopyPadExtParams<uint32_t>{false,0,0,0});
                     SyncMte2ToS();
-                    settled = 0;
-                    for (uint32_t c = 0; c < active; ++c)
-                        if (stampIn.GetValue(c) == expect[c]) ++settled;
+                    settled = 1;
+                    for (uint32_t c = 1; c < active; ++c)
+                        if (stampIn.GetValue(c - 1) == expect[c]) ++settled;
                 }
                 // The next launch reads the epoch before any core relies on it.  Every
                 // core that carries a row has already fetched this launch's epoch (it
@@ -1348,25 +1343,28 @@ public:
                 SyncSToMte3();
                 DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
                 DataCopyPad(epochWord, auxWords, pe);
-                DataCopyExtParams ps{1, static_cast<uint32_t>(active*slot*sizeof(float)), 0, 0, 0};
-                DataCopyPad(buf, wsAll, ps, DataCopyPadExtParams<float>{false,0,0,0});
-                SyncMte2ToV();
-                uint32_t left = active;
-                while (left > 1) {
-                    uint32_t half = left / 2;
-                    Add(buf, buf, buf[(uint64_t)half*slot], half*slot);
-                    if (left & 1u) {
-                        Adds(buf[(uint64_t)half*slot], buf[(uint64_t)(left - 1)*slot], 0.0f, slot);
-                        left = half + 1;
-                    } else {
-                        left = half;
-                    }
+                if (active > 1) {
+                    DataCopyExtParams ps{1, static_cast<uint32_t>((active - 1)*slot*sizeof(float)), 0, 0, 0};
+                    DataCopyPad(buf, wsAll[slot], ps, DataCopyPadExtParams<float>{false,0,0,0});
+                    SyncMte2ToV();
+                    // each published slot carries its gradients and its loss share
+                    for (uint32_t c = 1; c < active; ++c)
+                        Add(base[fOffDk], base[fOffDk], buf[(uint64_t)(c - 1)*slot], span + 1);
                 }
-                FastStore(dk, 0, buf, span);
+                FastStore(dk, 0, base[fOffDk], span);
                 // the merged loss lane leaves through the copy path as well
                 SyncVToMte3();
                 DataCopyExtParams pl{1, sizeof(float), 0, 0, 0};
-                DataCopyPad(loss[0], buf[span], pl);
+                DataCopyPad(loss[0], base[fOffDk][span], pl);
+            } else {
+                SyncVToMte3();
+                DataCopyExtParams pw{1, static_cast<uint32_t>((span + 1)*sizeof(float)), 0, 0, 0};
+                DataCopyPad(scratch, base[fOffDk], pw);
+                LocalTensor<uint32_t> stampOut = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
+                stampOut.SetValue(0, SliStamp(epoch, GetBlockIdx()));
+                SyncSToMte3();
+                DataCopyExtParams pz{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(stampArr[GetBlockIdx()], stampOut, pz);
             }
         } else {
             FastStore(dk, 0, base[fOffDk], keys*fDi);
