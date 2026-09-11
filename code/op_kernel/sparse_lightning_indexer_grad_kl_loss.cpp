@@ -126,7 +126,6 @@ class SparseGrad {
     uint64_t fOffQ, fOffQR, fOffQI, fOffW, fOffMax, fOffSum, fOffC;
     uint64_t fOffKey, fOffKeyR, fOffKi, fOffSim, fOffSelK, fOffSelKR, fOffSelKI;
     uint64_t fOffDk, fOffDq, fOffDw, fOffProd, fOffAux, fOffIdx, fOffRed;
-    uint64_t fOffBatchQ, fOffBatchR, fOffBatchS;
     GlobalTensor<float> wsAll;
     uint64_t fOffSco, fOffPos, fOffDiMat, fOffV, fOffU, fOffUmat, fOffDqAcc, fOffWStage;
     uint32_t fWStageStride;
@@ -180,9 +179,6 @@ class SparseGrad {
         fOffDq = FastTake(o, rows*ni*di);
         fOffDw = FastTake(o, rows*ni);
         fOffRed = FastTake(o, 4*batches*s2*di);
-        fOffBatchQ = FastTake(o, (uint64_t)k*n1*dq);
-        fOffBatchR = FastTake(o, (uint64_t)k*n1*dr);
-        fOffBatchS = FastTake(o, (uint64_t)k*ni*di);
         uint64_t wide = (s2 > kp ? s2 : kp);
         uint64_t dim = dq > dr ? dq : dr;
         if (di > dim) dim = di;
@@ -748,20 +744,6 @@ public:
                     }
                     }
                 }
-                if (fN1P == fN1) {
-                    LocalTensor<float> bq = base[fOffBatchQ];
-                    LocalTensor<float> br = base[fOffBatchR];
-                    for (uint32_t j = 0; j < m; ++j) {
-                        uint64_t kb = ((uint64_t)b*fS2 + sel[j]);
-                        Mul(bq[(uint64_t)j*fN1*fDq], qRow, base[fOffKey][kb*fDq], fDq, fN1,
-                            BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
-                        Mul(br[(uint64_t)j*fN1*fDr], qrRow, base[fOffKeyR][kb*fDr], fDr, fN1,
-                            BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
-                    }
-                    WholeReduceSum(sco, bq, fDq, m*fN1, 1, 1, fDq/8);
-                    WholeReduceSum(work, br, fDr, m*fN1, 1, 1, fDr/8);
-                    Add(sco, sco, work, m*fN1);
-                } else {
                 for (uint32_t j = 0; j < m; ++j) {
                     uint64_t kb = ((uint64_t)b*fS2 + sel[j]);
                     Mul(prod, qRow, base[fOffKey][kb*fDq], fDq, fN1, BinaryRepeatParams(1,1,1, fDq/8, fDq/8, 0));
@@ -769,7 +751,6 @@ public:
                     Mul(prod, qrRow, base[fOffKeyR][kb*fDr], fDr, fN1, BinaryRepeatParams(1,1,1, fDr/8, fDr/8, 0));
                     WholeReduceSum(work, prod, fDr, fN1, 1, 1, fDr/8);
                     Add(sco[j*fN1P], sco[j*fN1P], work, fN1);
-                }
                 }
                 Sub(sco, sco, cRow, fN1, m, BinaryRepeatParams(1, 1, 1, fN1P/8, fN1P/8, 0));
                 Exp(sco, sco, fN1, m, UnaryRepeatParams(1, 1, fN1P/8, fN1P/8));
