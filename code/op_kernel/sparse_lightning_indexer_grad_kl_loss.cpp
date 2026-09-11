@@ -1296,21 +1296,14 @@ public:
             // the epoch transfer was issued with the preamble, so it is long settled
             PipeBarrier<PIPE_ALL>();
             uint32_t epoch = auxWords.GetValue(kEpochLane);
+            // leave this core's partial, its loss share and a ready stamp in one
+            // transfer; the reader below picks the loss and the stamp out of the poll
             base[fOffDk].ReinterpretCast<uint32_t>().SetValue(span + 1, SliStamp(epoch, GetBlockIdx()));
             Duplicate(base[fOffDk][span], myLoss, 1);
             SyncSToMte3();
             SyncVToMte3();
             DataCopyExtParams pw{1, static_cast<uint32_t>((span + 2)*sizeof(float)), 0, 0, 0};
             DataCopyPad(scratch, base[fOffDk], pw);
-            if (GetBlockIdx() == 0) {
-                // The next launch reads this before any core stamps again, and it
-                // depends on nothing here, so it leaves together with the fold
-                // instead of trailing it.
-                auxWords.SetValue(kEpochLane, epoch + 1u);
-                SyncSToMte3();
-                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
-                DataCopyPad(epochWord, auxWords, pe);
-            }
             if (GetBlockIdx() == 0) {
                 // One copy brings in every core's partial together with the loss lane
                 // and the ready stamp that closes it, so the fold waits on a single
@@ -1346,6 +1339,14 @@ public:
                 SyncVToMte3();
                 DataCopyExtParams pl{1, sizeof(float), 0, 0, 0};
                 DataCopyPad(loss[0], buf[span], pl);
+                // The next launch reads this before any core stamps again.  It has to
+                // wait until the fold is done: a core that is still being dispatched
+                // has not fetched this launch's epoch yet, and a value that moves
+                // under it would make its stamps miss forever.
+                auxWords.SetValue(kEpochLane, epoch + 1u);
+                SyncSToMte3();
+                DataCopyExtParams pe{1, sizeof(uint32_t), 0, 0, 0};
+                DataCopyPad(epochWord, auxWords, pe);
             }
         } else {
             FastStore(dk, 0, base[fOffDk], keys*fDi);
