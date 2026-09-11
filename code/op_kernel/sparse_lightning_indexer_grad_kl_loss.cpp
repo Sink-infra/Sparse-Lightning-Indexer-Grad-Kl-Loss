@@ -927,13 +927,27 @@ public:
         if (first > fRows) first = fRows;
         uint32_t mine = last - first;
         bool narrowAligned = (fNIP == fNI) && (fN1P == fN1);
+        if (mine == 0) {
+            // The row budget is fixed, so a core without a row only has to
+            // publish its (zero) share of the merged gradient.
+            Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
+            PublishTiny(0.0f);
+            return;
+        }
+        // A core's rows never straddle a batch here, so only that batch's key
+        // rows have to be resident.
+        uint32_t kb0 = t.queryRows ? first / t.queryRows : 0u;
+        uint32_t kb1 = (last > first ? last - 1 : first) / (t.queryRows ? t.queryRows : 1u);
+        bool oneBatch = (kb0 == kb1);
+        uint32_t kbase = oneBatch ? kb0 : 0u;
+        uint32_t kcount = oneBatch ? fS2 : keys;
         // every transfer is issued before a single pipeline wait
         FastDma(base[fOffQ], q, (uint64_t)first*fN1*fDq, mine*fN1*fDq, fStgQ);
         FastDma(base[fOffQR], qr, (uint64_t)first*fN1*fDr, mine*fN1*fDr, fStgQR);
         FastDma(base[fOffQI], qi, (uint64_t)first*fNI*fDi, mine*fNI*fDi, fStgQI);
-        FastDma(base[fOffKey], k, 0, keys*fDq, fStgKey);
-        FastDma(base[fOffKeyR], kr, 0, keys*fDr, fStgKeyR);
-        FastDma(base[fOffKi], ki, 0, keys*fDi, fStgKi);
+        FastDma(base[fOffKey], k, (uint64_t)kbase*fS2*fDq, kcount*fDq, fStgKey);
+        FastDma(base[fOffKeyR], kr, (uint64_t)kbase*fS2*fDr, kcount*fDr, fStgKeyR);
+        FastDma(base[fOffKi], ki, (uint64_t)kbase*fS2*fDi, kcount*fDi, fStgKi);
         if (mine*fK) FastPad(idxT, indices, (uint64_t)first*fK, mine*fK);
         if (narrowAligned) {
             if constexpr (AscendC::IsSameType<W,float>::value) {
@@ -969,19 +983,16 @@ public:
                          RoundMode::CAST_NONE, static_cast<int32_t>(fNI));
             }
         }
-        FastCast<T>(base[fOffKey], fStgKey, keys*fDq);
-        FastCast<KR>(base[fOffKeyR], fStgKeyR, keys*fDr);
-        FastCast<T>(base[fOffKi], fStgKi, keys*fDi);
+        FastCast<T>(base[fOffKey], fStgKey, kcount*fDq);
+        FastCast<KR>(base[fOffKeyR], fStgKeyR, kcount*fDr);
+        FastCast<T>(base[fOffKi], fStgKi, kcount*fDi);
         Muls(base[fOffQ], base[fOffQ], t.scale, mine*fN1*fDq);
         Muls(base[fOffQR], base[fOffQR], t.scale, mine*fN1*fDr);
         Duplicate(base[fOffDk], 0.0f, (uint64_t)t.batch*fS2*fDi);
         if (mine) { Duplicate(base[fOffDq], 0.0f, mine*fNI*fDi); Duplicate(base[fOffDw], 0.0f, fRows*fNI); }
         if (!t.fastRecompute) {
-            Duplicate(base[fOffC], 0.0f, fRows*fN1P);
             Ln(base[fOffC], base[fOffSum], fRows*fN1P);
             Add(base[fOffC], base[fOffC], base[fOffMax], fRows*fN1P);
-        } else {
-            Duplicate(base[fOffC], 0.0f, fRows*fN1P);
         }
         LocalTensor<float> lossVec = base[fOffAux][512];
         LocalTensor<float> dIvec = base[fOffAux][128];
@@ -1053,6 +1064,7 @@ public:
                 if (token < first || token >= last) continue;
                 if (row >= qlen) continue;
                 uint32_t local = (uint32_t)(token - first);
+                uint32_t kbase = oneBatch ? 0u : static_cast<uint32_t>(b)*fS2;
                 int32_t visible = static_cast<int32_t>(row) + static_cast<int32_t>(klen)
                                   - static_cast<int32_t>(qlen) + 1;
                 uint32_t m = 0;
@@ -1090,7 +1102,7 @@ public:
                 }
                 // ---- main scores and indexer similarities at the selected keys ----
                 for (uint32_t j = 0; j < m; ++j) {
-                    uint64_t kb = (uint64_t)b*fS2 + sel[j];
+                    uint64_t kb = (uint64_t)kbase + sel[j];
                     Mul(prod, qRow, base[fOffKey][kb*fDq], fDq, (uint8_t)fN1,
                         BinaryRepeatParams(1, 1, 1, fDq/8, fDq/8, 0));
                     MulAddDst(prod, qrRow, base[fOffKeyR][kb*fDr], fDr, (uint8_t)fN1,
@@ -1141,7 +1153,7 @@ public:
                 Mul(ds, ds, wRow, fNI, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fNIP/8, fNIP/8, 0));
                 Brcb(dsspr, ds, (uint8_t)((m*fNIP)/8), BrcbRepeatParams(1, 8));
                 for (uint32_t j = 0; j < m; ++j) {
-                    uint64_t kb = (uint64_t)b*fS2 + sel[j];
+                    uint64_t kb = (uint64_t)kbase + sel[j];
                     MulAddDst(dwRow, sim[j*fNIP], dispr[j*8], fNI, 1,
                               BinaryRepeatParams(1, 1, 0, 1, 1, 1));
                     MulAddDst(dqOut, base[fOffKi][kb*fDi], dsspr[(uint64_t)j*fNIP*8], fDi, (uint8_t)fNI,
@@ -1166,25 +1178,38 @@ public:
             FastStore(dq, (uint64_t)first*fNI*fDi, base[fOffDq], mine*fNI*fDi);
             FastStore(dw, (uint64_t)first*fNI, base[fOffDw], mine*fNI);
         }
-        float myLoss = totalLoss;
+        PublishTiny(totalLoss);
+    }
+    // Publish this core's share of the merged gradient and of the loss.
+    __aicore__ inline void PublishTiny(float myLoss) {
+        LocalTensor<float> base = a;
+        uint32_t keys = static_cast<uint32_t>((uint64_t)t.batch*fS2);
+        uint32_t cores = t.cores ? t.cores : 1u;
         if (cores > 1) {
             DataCopyExtParams pw{1, static_cast<uint32_t>(keys*fDi*sizeof(float)), 0, 0, 0};
             SyncVToMte3();
             DataCopyPad(scratch, base[fOffDk], pw);
-            PipeBarrier<PIPE_ALL>();
-            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(scratch);
             losses.SetValue(GetBlockIdx()*16, myLoss);
-            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(losses);
+            DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE>(losses);
             SyncAll();
             if (GetBlockIdx() == 0) {
-                DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE>(wsAll);
-                PipeBarrier<PIPE_ALL>();
                 LocalTensor<float> acc = base[fOffRed];
                 DataCopyExtParams pr{1, static_cast<uint32_t>(cores*keys*fDi*sizeof(float)), 0, 0, 0};
                 DataCopyPad(acc, wsAll[0], pr, DataCopyPadExtParams<float>{false,0,0,0});
                 SyncMte2ToV();
+                // pairwise folding: halve the number of live partials per step
                 uint32_t span = keys*fDi;
-                for (uint32_t c = 1; c < cores; ++c) Add(acc, acc, acc[(uint64_t)c*span], span);
+                uint32_t left = cores;
+                while (left > 1) {
+                    uint32_t half = left / 2;
+                    Add(acc, acc, acc[(uint64_t)half*span], half*span);
+                    if (left & 1u) {
+                        Adds(acc[(uint64_t)half*span], acc[(uint64_t)(left - 1)*span], 0.0f, span);
+                        left = half + 1;
+                    } else {
+                        left = half;
+                    }
+                }
                 FastStore(dk, 0, acc, keys*fDi);
                 float total = 0;
                 for (uint32_t c = 0; c < cores; ++c) total += losses.GetValue(c*16);
