@@ -1014,6 +1014,12 @@ public:
             // at the end of the row work never waits on a fresh transfer
             LocalTensor<uint32_t> epochIn = base[fOffAux][kEpochLaneOffset].ReinterpretCast<uint32_t>();
             FastPad(epochIn, epochWord, 0, 1);
+            if constexpr (AscendC::IsSameType<T,float>::value) {
+                // the owner's clear is published just as early, so its word is worth
+                // fetching with the inputs: the fold usually finds it already landed
+                LocalTensor<uint32_t> clearIn = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
+                FastPad(clearIn, clearWord, 0, 1);
+            }
         }
         if (t.queryLengthType == 1) FastPad(qlenT, ql32, 0, t.batch);
         else if (t.queryLengthType == 2) FastPad(qlenT.ReinterpretCast<int64_t>(), ql64, 0, t.batch);
@@ -1247,10 +1253,13 @@ public:
         uint32_t cores = t.cores ? t.cores : 1u;
         uint32_t span = keys*fDi;
         if (cores > 1 && AscendC::IsSameType<T,float>::value) {
-            // the row owner has cleared the accumulators; fold this core's share in
+            // the row owner has cleared the accumulators; fold this core's share in.
+            // Its own clear already completed before it published the stamp, so the
+            // owner only has to confirm the word it prefetched with the inputs.
             LocalTensor<uint32_t> clearIn = base[fOffAux][kStampLaneOffset].ReinterpretCast<uint32_t>();
             uint32_t want = SliStamp(launchEpoch, kClearStamp);
-            uint32_t settled = 0;
+            PipeBarrier<PIPE_ALL>();
+            uint32_t settled = GetBlockIdx() == 0 || clearIn.GetValue(0) == want;
             while (!settled) {
                 SyncVToMte2();
                 DataCopyExtParams pr{1, sizeof(uint32_t), 0, 0, 0};
