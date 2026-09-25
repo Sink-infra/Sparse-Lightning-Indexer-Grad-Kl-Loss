@@ -1123,7 +1123,7 @@ public:
         // The supplied statistics may come from a lower-precision forward pass and
         // then no longer reproduce the exact visible normalizer, so the FP32 path
         // rebuilds every head's normalizer over the visible window instead.
-        bool useProvided = !t.fastRecompute;
+        constexpr bool useProvided = !AscendC::IsSameType<T,float>::value;
         for (uint32_t b = 0; b < t.batch; ++b) {
             uint32_t qlen = t.empty ? 0 : CachedLength(true, b, qlenT);
             uint32_t klen = CachedLength(false, b, klenT);
@@ -1141,6 +1141,11 @@ public:
                     if (key >= 0 && key < static_cast<int32_t>(klen) && key < visible) sel[m++] = (uint32_t)key;
                 }
                 if (m == 0) continue;
+                LocalTensor<uint32_t> selectedOffsets = base[fOffAux][1152].ReinterpretCast<uint32_t>();
+                if (!useProvided) {
+                    for (uint32_t j = 0; j < m; ++j) selectedOffsets.SetValue(j, sel[j]*sizeof(float));
+                    SyncSToV();
+                }
                 LocalTensor<float> qRow = base[fOffQ][(uint64_t)local*fN1*fDq];
                 LocalTensor<float> qrRow = base[fOffQR][(uint64_t)local*fN1*fDr];
                 LocalTensor<float> qiRow = base[fOffQI][(uint64_t)local*fNI*fDi];
@@ -1188,22 +1193,28 @@ public:
                     Adds(hSc, hSc, -gmx, vis, (uint8_t)fN1, UnaryRepeatParams(1, 1, hstride, hstride));
                     Exp(hSc, hSc, vis, (uint8_t)fN1, UnaryRepeatParams(1, 1, hstride, hstride));
                     WholeReduceSum(lossVec[128], hSc, vis, (uint8_t)fN1, 1, 1, hstride);
-                    Ln(lossVec[128], lossVec[128], fN1);
-                    Adds(cRow, lossVec[128], gmx, fN1);
+                    Brcb(prod, lossVec[128], (uint8_t)(fN1P/8), BrcbRepeatParams(1, 8));
+                    Div(hSc, hSc, prod, vis, (uint8_t)fN1,
+                        BinaryRepeatParams(1, 1, 0, hstride, hstride, 1));
+                    for (uint32_t heads = fN1/2; heads; heads /= 2)
+                        Add(hSc, hSc, hSc[heads*s2p], heads*s2p);
+                    Gather(massV, hSc, selectedOffsets, 0u, m);
                 }
                 // ---- main scores and indexer similarities at the selected keys ----
                 for (uint32_t j = 0; j < m; ++j) {
                     uint64_t kb = (uint64_t)kbase + sel[j];
-                    Mul(prod, qRow, base[fOffKey][kb*fDq], fDq, (uint8_t)fN1,
-                        BinaryRepeatParams(1, 1, 1, fDq/8, fDq/8, 0));
-                    MulAddDst(prod, qrRow, base[fOffKeyR][kb*fDr], fDr, (uint8_t)fN1,
-                              BinaryRepeatParams(1, 1, 1, fDq/8, fDr/8, 0));
-                    WholeReduceSum(sco[j*fN1P], prod, fDq, (uint8_t)fN1, 1, 1, fDq/8);
+                    if (useProvided) {
+                        Mul(prod, qRow, base[fOffKey][kb*fDq], fDq, (uint8_t)fN1,
+                            BinaryRepeatParams(1, 1, 1, fDq/8, fDq/8, 0));
+                        MulAddDst(prod, qrRow, base[fOffKeyR][kb*fDr], fDr, (uint8_t)fN1,
+                                  BinaryRepeatParams(1, 1, 1, fDq/8, fDr/8, 0));
+                        WholeReduceSum(sco[j*fN1P], prod, fDq, (uint8_t)fN1, 1, 1, fDq/8);
+                    }
                     Mul(prod, qiRow, base[fOffKi][kb*fDi], fDi, (uint8_t)fNI,
                         BinaryRepeatParams(1, 1, 1, fDi/8, fDi/8, 0));
                     WholeReduceSum(sim[j*fNIP], prod, fDi, (uint8_t)fNI, 1, 1, fDi/8);
                 }
-                Muls(sco, sco, t.scale, m*fN1P);
+                if (useProvided) Muls(sco, sco, t.scale, m*fN1P);
                 uint32_t mMask = m*fNIP;
                 Maxs(sim, sim, 0.0f, mMask);
                 Muls(ind, sim, 1e30f, mMask);
@@ -1211,9 +1222,11 @@ public:
                 // ---- selected softmax and KL ----
                 Mul(prod2, sim, wRow, fNI, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fNIP/8, fNIP/8, 0));
                 WholeReduceSum(logitV, prod2, fNI, (uint8_t)m, 1, 1, fNIP/8);
-                Sub(prod2, sco, cRow, fN1, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fN1P/8, fN1P/8, 0));
-                Exp(prod2, prod2, fN1, (uint8_t)m, UnaryRepeatParams(1, 1, fN1P/8, fN1P/8));
-                WholeReduceSum(massV, prod2, fN1, (uint8_t)m, 1, 1, fN1P/8);
+                if (useProvided) {
+                    Sub(prod2, sco, cRow, fN1, (uint8_t)m, BinaryRepeatParams(1, 1, 1, fN1P/8, fN1P/8, 0));
+                    Exp(prod2, prod2, fN1, (uint8_t)m, UnaryRepeatParams(1, 1, fN1P/8, fN1P/8));
+                    WholeReduceSum(massV, prod2, fN1, (uint8_t)m, 1, 1, fN1P/8);
+                }
                 // The FP32 rows already run the long visible-window chain, and there a
                 // scalar softmax would drain the vector pipe twice; the fp16 rows keep
                 // the scalar form, whose shorter chain wins when little vector work is
