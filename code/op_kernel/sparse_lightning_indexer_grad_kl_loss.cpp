@@ -132,7 +132,7 @@ __aicore__ inline SliPair SliPairLog(SliPair x) {
     return SliPair(seed)+residual-residual*residual*SliPair(0.5f);
 }
 
-template<class T, class W, class QR, class KR>
+template<class T, class W, class QR, class KR, bool STATIC_TINY>
 class SparseGrad {
     GlobalTensor<T> q, k, qi, ki, dq, dk;
     GlobalTensor<W> w, dw;
@@ -356,8 +356,15 @@ public:
         uint64_t genFloats = 2*(uint64_t)cacheSize + 512*8 + 128*4 + 64;
         uint64_t fastFloats = t.fast ? FastLayout() : 0;
         uint64_t totalFloats = genFloats > fastFloats ? genFloats : fastFloats;
-        pipe->InitBuffer(storage, totalFloats*sizeof(float));
-        auto mem = storage.Get<float>();
+        LocalTensor<float> mem;
+        if constexpr (STATIC_TINY) {
+            // The tiny layout already owns the complete UB span. Skip TPipe's
+            // per-block pool setup and address the same aligned span directly.
+            mem = LocalTensor<float>(TPosition::VECCALC, 0, static_cast<uint32_t>(totalFloats));
+        } else {
+            pipe->InitBuffer(storage, totalFloats*sizeof(float));
+            mem = storage.Get<float>();
+        }
         a = mem; b = mem[512]; product = mem[1024]; temporary = mem[1536]; result = mem[2048];
         raw = mem[2560].ReinterpretCast<uint8_t>();
         qiCache = mem[3072]; dqCache = mem[3072+cacheSize];
@@ -530,42 +537,50 @@ public:
         return sum;
     }
     __aicore__ inline void SyncMte2ToS() {
-        TEventID id = pipe->FetchEventID(HardEvent::MTE2_S);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::MTE2_S);
         SetFlag<HardEvent::MTE2_S>(id);
         WaitFlag<HardEvent::MTE2_S>(id);
     }
     __aicore__ inline void SyncMte2ToV() {
-        TEventID id = pipe->FetchEventID(HardEvent::MTE2_V);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::MTE2_V);
         SetFlag<HardEvent::MTE2_V>(id);
         WaitFlag<HardEvent::MTE2_V>(id);
     }
     __aicore__ inline void SyncVToMte3() {
-        TEventID id = pipe->FetchEventID(HardEvent::V_MTE3);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::V_MTE3);
         SetFlag<HardEvent::V_MTE3>(id);
         WaitFlag<HardEvent::V_MTE3>(id);
     }
     __aicore__ inline void SyncVToMte2() {
-        TEventID id = pipe->FetchEventID(HardEvent::V_MTE2);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::V_MTE2);
         SetFlag<HardEvent::V_MTE2>(id);
         WaitFlag<HardEvent::V_MTE2>(id);
     }
     __aicore__ inline void SyncMte3ToV() {
-        TEventID id = pipe->FetchEventID(HardEvent::MTE3_V);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::MTE3_V);
         SetFlag<HardEvent::MTE3_V>(id);
         WaitFlag<HardEvent::MTE3_V>(id);
     }
     __aicore__ inline void SyncVToS() {
-        TEventID id = pipe->FetchEventID(HardEvent::V_S);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::V_S);
         SetFlag<HardEvent::V_S>(id);
         WaitFlag<HardEvent::V_S>(id);
     }
     __aicore__ inline void SyncSToV() {
-        TEventID id = pipe->FetchEventID(HardEvent::S_V);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::S_V);
         SetFlag<HardEvent::S_V>(id);
         WaitFlag<HardEvent::S_V>(id);
     }
     __aicore__ inline void SyncSToMte3() {
-        TEventID id = pipe->FetchEventID(HardEvent::S_MTE3);
+        TEventID id = EVENT_ID0;
+        if constexpr (!STATIC_TINY) id = pipe->FetchEventID(HardEvent::S_MTE3);
         SetFlag<HardEvent::S_MTE3>(id);
         WaitFlag<HardEvent::S_MTE3>(id);
     }
@@ -1566,7 +1581,8 @@ public:
     }
 };
 
-template<typename DT_QUERY, typename DT_WEIGHT, typename DT_QROPE, typename DT_KROPE>
+template<typename DT_QUERY, typename DT_WEIGHT, typename DT_QROPE, typename DT_KROPE,
+         bool STATIC_TINY>
 __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     GM_ADDR query, GM_ADDR key, GM_ADDR queryIndex, GM_ADDR keyIndex, GM_ADDR weights,
     GM_ADDR sparseIndices, GM_ADDR softmaxMax, GM_ADDR softmaxSum, GM_ADDR queryRope,
@@ -1577,9 +1593,18 @@ __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(SparseLightningIndexerGradKlLossTilingData);
     GET_TILING_DATA_WITH_STRUCT(SparseLightningIndexerGradKlLossTilingData,t,tiling);
-    SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE> op;
-    TPipe pipe;
-    op.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
-        queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),&pipe,t);
-    op.Process();
+    if constexpr (STATIC_TINY) {
+        InitSocState();
+        SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE,STATIC_TINY> op;
+        op.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
+            queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),nullptr,t);
+        op.Process();
+        PipeBarrier<PIPE_ALL>();
+    } else {
+        TPipe pipe;
+        SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE,STATIC_TINY> op;
+        op.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
+            queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),&pipe,t);
+        op.Process();
+    }
 }
