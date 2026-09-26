@@ -1,3 +1,4 @@
+#define K_MAX_SHAPE_DIM 0
 #include "kernel_operator.h"
 #include "sparse_lightning_indexer_grad_kl_loss_tiling.h"
 #include "tiling_key_sparse_lightning_indexer_grad_kl_loss.h"
