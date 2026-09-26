@@ -225,7 +225,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     }
     *context->GetTilingData<Tiling>() = t;
     uint32_t DT_QUERY = core, DT_WEIGHT = wt, DT_QROPE = in[8]->GetDataType(), DT_KROPE = in[9]->GetDataType();
-    ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE);
+    // The direct-UB entry saves a fixed per-block cost. Keep it for rows whose
+    // sparse dot work is small enough for that cost to matter; larger tiny rows
+    // retain the original TPipe entry and event allocation.
+    uint64_t tinyWork = static_cast<uint64_t>(t.batch) * t.queryRows * t.sparseSize *
+        (static_cast<uint64_t>(t.queryHeads) * (t.queryDim + t.ropeDim) +
+         static_cast<uint64_t>(t.indexHeads) * t.indexDim);
+    uint32_t STATIC_TINY = t.tiny && tinyWork <= 4096u ? 1u : 0u;
+    ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE, STATIC_TINY);
     context->SetBlockDim(t.cores);
     context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize() +
         (t.batchScratch * t.cores + t.cores * 16 + TinySyncFloats) * sizeof(float);
