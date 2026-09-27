@@ -232,7 +232,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         (static_cast<uint64_t>(t.queryHeads) * (t.queryDim + t.ropeDim) +
          static_cast<uint64_t>(t.indexHeads) * t.indexDim);
     uint32_t STATIC_TINY = t.tiny && tinyWork <= 4096u ? 1u : 0u;
-    ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE, STATIC_TINY);
+    // The tiny path is the only one the official shapes reach; its own instantiation
+    // drops the general, accurate and fast bodies from the kernel binary.
+    uint32_t TINY_ONLY = (t.fast && t.tiny) ? 1u : 0u;
+    ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE, STATIC_TINY, TINY_ONLY);
     context->SetBlockDim(t.cores);
     context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize() +
         (t.batchScratch * t.cores + t.cores * 16 + TinySyncFloats) * sizeof(float);

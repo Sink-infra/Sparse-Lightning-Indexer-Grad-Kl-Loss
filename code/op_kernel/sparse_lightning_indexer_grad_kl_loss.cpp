@@ -133,7 +133,7 @@ __aicore__ inline SliPair SliPairLog(SliPair x) {
     return SliPair(seed)+residual-residual*residual*SliPair(0.5f);
 }
 
-template<class T, class W, class QR, class KR, bool STATIC_TINY>
+template<class T, class W, class QR, class KR, bool STATIC_TINY, bool TINY_ONLY>
 class SparseGrad {
     GlobalTensor<T> q, k, qi, ki, dq, dk;
     GlobalTensor<W> w, dw;
@@ -352,10 +352,23 @@ public:
         clearWord.SetGlobalBuffer((__gm__ uint32_t*)workspace + syncBase + kClearLane);
         // compact ready words, one per participating core, behind the slots
         stampArr.SetGlobalBuffer((__gm__ uint32_t*)workspace + (uint64_t)t.cores*t.batchScratch);
+        uint64_t fastFloats = FastLayout();
+        if constexpr (TINY_ONLY) {
+            // the tiny instantiation keeps only the fast layout, so the general path's
+            // scratch tensors, index offsets and their sizing never materialise
+            LocalTensor<float> tinyMem;
+            if constexpr (STATIC_TINY) {
+                tinyMem = LocalTensor<float>(TPosition::VECCALC, 0, static_cast<uint32_t>(fastFloats));
+            } else {
+                pipe->InitBuffer(storage, fastFloats*sizeof(float));
+                tinyMem = storage.Get<float>();
+            }
+            a = tinyMem;
+            return;
+        }
         stride = (t.indexDim + 7)/8*8;
         uint32_t cacheSize = t.indexHeads*stride;
         uint64_t genFloats = 2*(uint64_t)cacheSize + 512*8 + 128*4 + 64;
-        uint64_t fastFloats = t.fast ? FastLayout() : 0;
         uint64_t totalFloats = genFloats > fastFloats ? genFloats : fastFloats;
         LocalTensor<float> mem;
         if constexpr (STATIC_TINY) {
@@ -1451,6 +1464,10 @@ public:
         }
     }
     __aicore__ inline void Process() {
+        if constexpr (TINY_ONLY) {
+            ProcessTiny();
+            return;
+        }
         if (t.fast) {
             if (t.tiny) { ProcessTiny(); return; }
             ProcessFast();
@@ -1583,7 +1600,7 @@ public:
 };
 
 template<typename DT_QUERY, typename DT_WEIGHT, typename DT_QROPE, typename DT_KROPE,
-         bool STATIC_TINY>
+         bool STATIC_TINY, bool TINY_ONLY>
 __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     GM_ADDR query, GM_ADDR key, GM_ADDR queryIndex, GM_ADDR keyIndex, GM_ADDR weights,
     GM_ADDR sparseIndices, GM_ADDR softmaxMax, GM_ADDR softmaxSum, GM_ADDR queryRope,
@@ -1596,14 +1613,14 @@ __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     GET_TILING_DATA_WITH_STRUCT(SparseLightningIndexerGradKlLossTilingData,t,tiling);
     if constexpr (STATIC_TINY) {
         InitSocState();
-        SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE,STATIC_TINY> op;
+        SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE,STATIC_TINY,TINY_ONLY> op;
         op.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
             queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),nullptr,t);
         op.Process();
         PipeBarrier<PIPE_ALL>();
     } else {
         TPipe pipe;
-        SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE,STATIC_TINY> op;
+        SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE,STATIC_TINY,TINY_ONLY> op;
         op.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
             queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),&pipe,t);
         op.Process();
