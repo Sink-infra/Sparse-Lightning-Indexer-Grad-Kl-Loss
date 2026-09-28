@@ -204,9 +204,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     // The vector-only launch carries no hardware barrier; only the tiny path may
     // split rows across cores, because it synchronizes through the workspace.
     if (t.fast && !t.tiny) t.cores = 1u;
-    // FP32 fixtures may carry statistics from a lower-precision forward pass; the
-    // accurate reference rebuilds the visible normalizer, so mirror it on device.
-    t.fastRecompute = (t.fast && core == ge::DT_FLOAT) ? 1u : 0u;
+    // The tiny path reconstructs the main distribution from the supplied statistics -
+    // that is what the operator is specified to do - so only the wide FP32 shapes
+    // rebuild the visible normalizer on device.
+    t.fastRecompute = (t.fast && core == ge::DT_FLOAT && !t.tiny) ? 1u : 0u;
     if (t.fast) {
         uint64_t dkElems = static_cast<uint64_t>(t.batch) * t.keyRows * t.indexDim;
         // the tiny slot keeps one spare lane for the core's loss share

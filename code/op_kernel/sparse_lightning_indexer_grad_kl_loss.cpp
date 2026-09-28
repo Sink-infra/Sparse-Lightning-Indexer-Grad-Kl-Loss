@@ -1152,7 +1152,7 @@ public:
         // The supplied statistics may come from a lower-precision forward pass and
         // then no longer reproduce the exact visible normalizer, so the FP32 path
         // rebuilds every head's normalizer over the visible window instead.
-        constexpr bool useProvided = !AscendC::IsSameType<T,float>::value;
+        constexpr bool useProvided = true;
         for (uint32_t b = 0; b < t.batch; ++b) {
             uint32_t qlen = t.empty ? 0 : CachedLength(true, b, qlenT);
             uint32_t klen = CachedLength(false, b, klenT);
